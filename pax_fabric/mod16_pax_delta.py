@@ -77,7 +77,14 @@ _DEFAULT_DELTA_MAX_ATTEMPTS = 4
 _DEFAULT_DELTA_BASE_DELAY_SEC = 2.0
 _DEFAULT_DELTA_MAX_DELAY_SEC = 60.0
 
+# Maximum number of columns that may be auto-dropped from an existing Delta
+# table when the incoming CSV is missing them. Cap exists so a buggy/empty
+# upstream CSV cannot silently shrink a healthy table to a few columns.
+# Above this threshold the write is refused with [SCHEMA_DRIFT_TOO_LARGE].
+_MAX_AUTO_DROP_COLUMNS = 2
+
 # Substrings (case-insensitive) that mark an exception as worth retrying.
+
 # Covers ABFSS HTTP errors, network/timeout errors, Delta concurrent-commit
 # conflicts, and OneLake auth-token expiry.
 _TRANSIENT_DELTA_PATTERNS = (
@@ -738,6 +745,69 @@ def convert_csv_to_delta(
     }
 
 
+# Default Arrow scan batch size for streaming column drops. ~100k rows of
+# string columns is tens of MB resident, which keeps the operation bounded
+# on any reasonable notebook driver regardless of underlying table size.
+_AUTO_DROP_BATCH_SIZE = 100_000
+
+
+def _auto_drop_delta_columns(
+    target_uri: str,
+    drop_cols: list[str],
+    *,
+    storage_options: dict | None,
+    batch_size: int = _AUTO_DROP_BATCH_SIZE,
+) -> int:
+    """Rewrite the Delta table without the named columns, preserving all rows.
+
+    Used by :func:`write_delta_append` to auto-reconcile the physical Delta
+    schema when the incoming CSV is missing column(s) that exist on disk.
+    The rewrite uses ``mode='overwrite'`` + ``schema_mode='overwrite'`` so the
+    deltalake writer fully replaces the table schema. The default
+    ``schema_mode='merge'`` used by :func:`convert_csv_to_delta` cannot drop
+    columns, so this dedicated path is required.
+
+    Memory: streams the table in batches of ``batch_size`` rows via the
+    PyArrow dataset scanner and pipes a ``RecordBatchReader`` directly into
+    ``write_deltalake``. Peak RAM is bounded by the batch size, not the table
+    size, so this is safe for tables with millions of rows. Column projection
+    happens during the Parquet read so the dropped columns are never
+    materialized at all.
+
+    Returns the row count preserved after the drop (read from Parquet
+    footer metadata, so no extra scan is required).
+
+    The previous schema and data are NOT destroyed -- Delta time-travel keeps
+    the prior version available via
+    ``DeltaTable(uri).restore(version=N)`` for the lakehouse's configured
+    retention window (Fabric default: 7 days).
+    """
+    from deltalake import DeltaTable
+    from deltalake import write_deltalake as _write_deltalake
+
+    dt = DeltaTable(target_uri, storage_options=storage_options)
+
+    existing_cols = [f.name for f in dt.schema().fields]
+    drop_lower = {c.lower() for c in drop_cols}
+    keep = [c for c in existing_cols if c.lower() not in drop_lower]
+
+    dataset = dt.to_pyarrow_dataset()
+    # Metadata-only count from Parquet footers -- does not scan data pages.
+    row_count = dataset.count_rows()
+
+    scanner = dataset.scanner(columns=keep, batch_size=batch_size)
+    reader = scanner.to_reader()
+
+    _write_deltalake(
+        target_uri,
+        reader,
+        mode="overwrite",
+        schema_mode="overwrite",
+        storage_options=storage_options,
+    )
+    return row_count
+
+
 def test_delta_table_schema_compat(
     target_uri: str,
     new_csv: str,
@@ -920,36 +990,107 @@ def write_delta_append(
     # PS L8208: isInit when existing cols are empty (table doesn't exist or empty).
     is_init = not probe.get("existing_cols")
 
-    # Step 2: Reject destructive drift. PS L8210-8214.
+    # Step 2: Auto-reconcile destructive drift. PS L8210-8214 originally rejected;
+    # we now drop the missing columns from the existing Delta table so the new
+    # CSV's schema becomes the source of truth. A safety cap (_MAX_AUTO_DROP_COLUMNS)
+    # still rejects writes that would drop "too many" columns at once -- those are
+    # almost always upstream bugs (truncated/empty CSVs), not intentional schema
+    # changes. Delta time-travel preserves the pre-drop version for ~7 days, so
+    # an accidental drop is recoverable via DeltaTable(uri).restore(version=N).
+    dropped_cols: list[str] = []
     if not probe["compatible"] and not is_init:
-        missing_list = ', '.join(probe.get("missing", []))
-        msg = (
-            f"Write-DeltaAppend: destructive schema drift rejected. "
-            f"Existing column(s) not present in source CSV: {missing_list}"
-        )
-        log.error(msg)
+        missing_cols = list(probe.get("missing", []))
+        missing_list = ', '.join(missing_cols)
+
+        if len(missing_cols) > _MAX_AUTO_DROP_COLUMNS:
+            msg = (
+                f"Write-DeltaAppend: refusing to auto-drop {len(missing_cols)} "
+                f"columns from '{table_name}' (cap is {_MAX_AUTO_DROP_COLUMNS}). "
+                f"Existing column(s) not in source CSV: {missing_list}"
+            )
+            log.error(msg)
+            if log_fn:
+                log_fn(
+                    f"Delta write '{table_name}' FAILED [SCHEMA_DRIFT_TOO_LARGE]: {msg}",
+                    "ERROR",
+                )
+                log_fn(
+                    f"Delta write '{table_name}' \u2192 More than "
+                    f"{_MAX_AUTO_DROP_COLUMNS} existing columns are missing "
+                    "from the new CSV. This is almost always a truncated or "
+                    "empty upstream export rather than a deliberate schema "
+                    "change, so the write is refused to prevent silent data "
+                    "loss. Inspect the CSV under Files/pax/csv/<run_id>/; if "
+                    "the change is intentional, raise _MAX_AUTO_DROP_COLUMNS "
+                    "in mod16_pax_delta.py.",
+                    "ERROR",
+                )
+            return {
+                "success": False,
+                "is_init": False,
+                "added_cols": [],
+                "missing": missing_cols,
+                "error": f"[SCHEMA_DRIFT_TOO_LARGE] {msg}",
+                "error_category": "SCHEMA_DRIFT_TOO_LARGE",
+                "rows_written": 0,
+            }
+
+        # Within cap -- attempt the auto-drop.
         if log_fn:
             log_fn(
-                f"Delta write '{table_name}' FAILED [SCHEMA_DRIFT]: {msg}",
-                "ERROR",
+                f"Delta write '{table_name}' AUTO_DROP: removing "
+                f"{len(missing_cols)} column(s) from existing Delta table to "
+                f"match new CSV schema: {missing_list}",
+                "WARN",
             )
             log_fn(
-                f"Delta write '{table_name}' \u2192 The new CSV is missing "
-                "column(s) that exist in the current Delta table. This "
-                "would silently drop data, so the write is refused. Re-run "
-                "with the missing column(s) restored upstream, or drop the "
-                "table in Fabric if you intend a fresh start.",
-                "ERROR",
+                f"Delta write '{table_name}' \u2192 Pre-drop table version is "
+                "retained via Delta time-travel (~7 days). Restore with "
+                "DeltaTable(uri).restore(version=N) if this drop was unintended.",
+                "WARN",
             )
-        return {
-            "success": False,
-            "is_init": False,
-            "added_cols": [],
-            "missing": list(probe.get("missing", [])),
-            "error": f"[SCHEMA_DRIFT] {msg}",
-            "error_category": "SCHEMA_DRIFT",
-            "rows_written": 0,
-        }
+
+        try:
+            drop_opts = _build_storage_options(target_uri, bearer_token, storage_options)
+            rows_kept = _auto_drop_delta_columns(
+                target_uri, missing_cols, storage_options=drop_opts,
+            )
+            dropped_cols = missing_cols
+            if log_fn:
+                log_fn(
+                    f"Delta write '{table_name}' AUTO_DROP succeeded: "
+                    f"{rows_kept:,} row(s) preserved, columns dropped: "
+                    f"{missing_list}",
+                    "WARN",
+                )
+        except Exception as drop_exc:  # noqa: BLE001 -- log + fail-soft
+            err_msg = f"{type(drop_exc).__name__}: {drop_exc}"
+            log.error(
+                "Write-DeltaAppend: auto-drop failed for '%s' (cols=%s): %s",
+                table_name, missing_list, err_msg,
+            )
+            if log_fn:
+                log_fn(
+                    f"Delta write '{table_name}' FAILED [AUTO_DROP_FAILED]: "
+                    f"{err_msg}. Columns we tried to drop: {missing_list}.",
+                    "ERROR",
+                )
+            return {
+                "success": False,
+                "is_init": False,
+                "added_cols": [],
+                "missing": missing_cols,
+                "error": f"[AUTO_DROP_FAILED] {err_msg}",
+                "error_category": "AUTO_DROP_FAILED",
+                "rows_written": 0,
+            }
+
+        # Re-probe so downstream added_cols / strategy steps see the new schema.
+        probe = test_delta_table_schema_compat(
+            target_uri, input_csv,
+            bearer_token=bearer_token,
+            storage_options=storage_options,
+        )
 
     # Step 3: Compute added columns. PS L8216.
     # Case-insensitive comparison (PS uses OrdinalIgnoreCase HashSet).
@@ -993,6 +1134,7 @@ def write_delta_append(
             "success": False,
             "is_init": is_init,
             "added_cols": added_cols,
+            "dropped_cols": dropped_cols,
             "missing": [],
             "error": f"[CONFIG_ERROR] {exc}",
             "error_category": "CONFIG_ERROR",
@@ -1043,6 +1185,7 @@ def write_delta_append(
             "success": False,
             "is_init": is_init,
             "added_cols": added_cols,
+            "dropped_cols": dropped_cols,
             "missing": [],
             "error": str(exc),
             "error_category": exc.category,
@@ -1068,6 +1211,7 @@ def write_delta_append(
             "success": False,
             "is_init": is_init,
             "added_cols": added_cols,
+            "dropped_cols": dropped_cols,
             "missing": [],
             "error": msg,
             "error_category": category,
@@ -1077,12 +1221,14 @@ def write_delta_append(
     # Step 5: Log success. PS L8220-8222.
     tag = '[append-init]' if is_init else '[append]'
     col_note = f" (added columns: {', '.join(added_cols)})" if added_cols else ''
-    log.info("Write-DeltaAppend: %s '%s'%s", tag, target_uri, col_note)
+    drop_note = f" (dropped columns: {', '.join(dropped_cols)})" if dropped_cols else ''
+    log.info("Write-DeltaAppend: %s '%s'%s%s", tag, target_uri, col_note, drop_note)
 
     return {
         "success": True,
         "is_init": is_init,
         "added_cols": added_cols,
+        "dropped_cols": dropped_cols,
         "missing": [],
         "error": None,
         "error_category": None,

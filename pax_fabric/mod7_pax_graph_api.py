@@ -347,15 +347,16 @@ def invoke_graph_audit_query(
         # the SAME block in-place (PS parity: while -not $createSuccess loop
         # retries up to 20 times on 429).
         if isinstance(status_code, int) and status_code in (429, 503):
-            logger.error("[NETWORK] Graph audit query submit failed (retriable): %s", e)
+            logger.error("[NETWORK] Graph audit query submit failed (throttle-class — caller decides retry): %s", e)
             raise  # Orchestrator will backoff + retry the block
 
         # Transient network errors: let them propagate so orchestrator can retry.
         # Mirrors PS L17858-18085: network errors → retry within tolerance window.
         # Covers DNS failures, connection resets, timeouts, RemoteDisconnected.
+        # NB: retriability is decided by the caller's _is_transient() classifier.
         import requests.exceptions as _rexc
         if isinstance(e, (_rexc.ConnectionError, _rexc.Timeout, _rexc.ChunkedEncodingError, ConnectionError, OSError)):
-            logger.error("[NETWORK] Graph audit query submit failed (retriable): %s", e)
+            logger.error("[NETWORK] Graph audit query submit failed (network-class — caller decides retry): %s", e)
             raise  # Orchestrator will backoff + retry the block
 
         logger.error("ERROR: Failed to submit Graph audit query: %s", e)
@@ -440,9 +441,11 @@ def get_graph_audit_query_status(
         # Transient network errors: let them propagate so _query_fn's poll loop retries.
         # Mirrors PS L18060-18085: network errors during poll → retry within tolerance.
         # _query_fn catches via `except Exception as poll_ex: continue`.
+        # NB: retriability is decided by the caller's _is_transient() classifier —
+        # this log line only states that the exception belongs to the network class.
         import requests.exceptions as _rexc
         if isinstance(e, (_rexc.ConnectionError, _rexc.Timeout, _rexc.ChunkedEncodingError, ConnectionError, OSError)):
-            logger.error("[NETWORK] Graph query status poll failed (retriable): %s", e)
+            logger.error("[NETWORK] Graph query status poll failed (network-class — caller decides retry): %s", e)
             raise  # _query_fn poll loop will retry
 
         logger.error("ERROR: Failed to get Graph query status: %s", e)
@@ -719,8 +722,24 @@ def get_graph_audit_records(
                 )
                 raise  # Orchestrator will backoff + retry the block
 
+            # ----- 3. 404/410 dead query — PS L23223-L23245 "[QUERY-GONE]" -----
+            # Graph dropped server-side state for this query_id mid-fetch.
+            # Must NOT swallow as `return []` — that silently zeros the
+            # partition's record count and the orchestrator advances the
+            # checkpoint past lost data. Raise so mod11 returns status=failed,
+            # the partition lands in failed_partitions, and the after-sweep
+            # re-submits with a fresh query_id (PS L25809-L25814).
+            if is_unresumable:
+                logger.error(
+                    "%s[QUERY-GONE] Graph dropped query state mid-fetch "
+                    "(status=%s, %d records preserved on disk will be "
+                    "re-fetched on partition retry with a fresh query_id): %s",
+                    _pfx, status_code, _total_fetched, e,
+                )
+                raise  # Orchestrator restarts partition with fresh query_id
+
             logger.error("ERROR: Failed to retrieve Graph audit records: %s", e)
-            return []
+            raise  # Surface to orchestrator instead of silently returning []
 
     if page_callback is not None:
         # Records are already on disk via page_callback. Return a placeholder

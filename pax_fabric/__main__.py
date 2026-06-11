@@ -190,11 +190,15 @@ def _append_records_to_jsonl(
     return len(records)
 
 
-def _iter_jsonl_shards(shard_paths: list[str]):
+def _iter_jsonl_shards(shard_paths: list[str], *, on_corrupt_line=None):
     """Yield records one at a time from a list of JSONL shard files.
 
     Logs progress per shard so Phase 6 callers can see which shard is being
     drained at any moment.
+
+    on_corrupt_line: optional callback ``fn(path, line_no, err)`` invoked
+    once per malformed JSONL line. PS-aligned: makes corruption loud rather
+    than silently dropping the record.
     """
     total = len(shard_paths)
     for idx, path in enumerate(shard_paths, start=1):
@@ -203,15 +207,29 @@ def _iter_jsonl_shards(shard_paths: list[str]):
             f"  [SPILL] Reading shard {idx}/{total}: {shard_name}"
         )
         records_in_shard = 0
+        corrupt_in_shard = 0
         try:
             with open(path, "r", encoding="utf-8") as f:
-                for line in f:
+                for line_no, line in enumerate(f, start=1):
                     if not line.strip():
                         continue
                     try:
                         yield json.loads(line)
                         records_in_shard += 1
-                    except json.JSONDecodeError:
+                    except json.JSONDecodeError as ex:
+                        corrupt_in_shard += 1
+                        preview = line[:120].rstrip()
+                        write_log(
+                            f"  [SPILL] Corrupt JSONL line dropped: "
+                            f"shard={shard_name} line={line_no} err={ex} "
+                            f"preview={preview!r}",
+                            level="ERROR",
+                        )
+                        if on_corrupt_line is not None:
+                            try:
+                                on_corrupt_line(path, line_no, str(ex))
+                            except Exception:
+                                pass
                         continue
         except OSError as ex:
             write_log(
@@ -219,9 +237,13 @@ def _iter_jsonl_shards(shard_paths: list[str]):
                 level="WARN",
             )
             continue
-        write_log(
-            f"  [SPILL] Shard {idx}/{total} drained: {records_in_shard} record(s) yielded"
+        msg = (
+            f"  [SPILL] Shard {idx}/{total} drained: "
+            f"{records_in_shard} record(s) yielded"
         )
+        if corrupt_in_shard:
+            msg += f", {corrupt_in_shard} corrupt line(s) dropped"
+        write_log(msg)
 
 
 def _cleanup_spilled_shards(
@@ -779,7 +801,15 @@ def main() -> int:
                 rows_written += len(pending_rows)
                 pending_rows.clear()
 
-            for record in _iter_jsonl_shards(spilled_shards):
+            def _on_corrupt_jsonl(_p, _ln, _err):
+                ctx.metrics.data_loss_events.append(
+                    f"jsonl_corrupt_line shard={Path(_p).name} "
+                    f"line={_ln} err={_err}"
+                )
+
+            for record in _iter_jsonl_shards(
+                spilled_shards, on_corrupt_line=_on_corrupt_jsonl
+            ):
                 # Deduplication by RecordId / Id
                 rid = record.get('Id') or record.get('RecordId', '')
                 if rid:
@@ -1190,13 +1220,30 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
     _thread_sessions: dict[int, requests.Session] = {}
     _session_lock = threading.Lock()
 
-    # Tracks partitions that already had a recorded data-loss event in this
-    # run so we only bump partitions_with_data_loss once per partition even
-    # if multiple queries within it fail.
+    # Tracks partitions that already had a recorded FINAL data-loss event in
+    # this run so we only bump partitions_with_data_loss once per partition.
+    # Per-attempt failures (recoverable by the end-of-run sweep) do NOT bump
+    # the counter — only the post-sweep "still failed" verdict does. This
+    # mirrors PowerShell's $script:partitionStatus state machine where
+    # `Status='Failed'` is final, not transient.
     _data_loss_lock = threading.Lock()
     _data_loss_partitions: set[int] = set()
+    # Latest failure descriptor per partition — used by the after-sweep
+    # block to record the final loss without re-deriving context.
+    _partition_failure_context: dict[int, dict] = {}
 
-    def _record_auth_data_loss(
+    class PartitionRetryableError(Exception):
+        """Raised by ``_query_fn`` when a transient failure (auth, protocol,
+        network, status='failed') should be handled by the end-of-run retry
+        sweep instead of silently producing zero records.
+
+        mod11's ``invoke_partition_graph_processing`` catches Exception and
+        converts it to ``status='failed'``; ``_run_partition`` then re-raises
+        as ``RuntimeError`` so the existing ThreadPoolExecutor sweep at
+        ``__main__.py`` end-of-run picks it up for a retry pass.
+        """
+
+    def _record_data_loss(
         *,
         phase: str,
         partition_index: int,
@@ -1207,25 +1254,109 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
         records_lost: int = 0,
         records_salvaged: int = 0,
         reason: str = "",
+        cause: str = "auth",
+        final: bool = False,
     ) -> None:
-        """Record an AUTH-401 induced data-loss event in run metrics and log
-        a single, greppable ``[PARTITION DATA LOST]`` line so the failure
-        cannot hide behind ``success=True``.
+        """Record a partition failure event in run metrics.
+
+        With ``final=False`` (default): record diagnostic event in
+        ``data_loss_events`` and bump per-attempt counters
+        (``auth_failures_total``) — the partition is presumed retriable by
+        the end-of-run sweep, so ``partitions_with_data_loss`` is NOT bumped
+        yet. Stash context in ``_partition_failure_context`` so the after-
+        sweep block can finalize the loss if the partition can't be recovered.
+
+        With ``final=True``: also bump ``partitions_with_data_loss`` (once
+        per partition via ``_data_loss_partitions`` dedup set) and emit a
+        ``[PARTITION DATA LOST]`` ERROR log. Used by:
+          (a) salvage paths inside ``_query_fn`` (auth-during-fetch with
+              partial records preserved — partition completes with what it
+              got, no further retry attempted), and
+          (b) the after-sweep block when a partition remains failed after
+              ``partition_max_attempts`` retry passes.
+
+        ``cause`` classifies the origin so auth-specific counters only bump
+        for auth events. Supported values: 'auth', 'network', 'protocol',
+        'unknown'.
         """
         descriptor = (
-            f"p={partition_index} q#{query_number} phase={phase} "
+            f"p={partition_index} q#{query_number} phase={phase} cause={cause} "
             f"block={block_start.isoformat()}..{block_end.isoformat()} "
             f"activity={activity_type} lost={records_lost} salvaged={records_salvaged}"
             + (f" reason={reason}" if reason else "")
         )
         with _data_loss_lock:
-            ctx.metrics.auth_failures_total += 1
-            ctx.metrics.records_salvaged_after_auth += max(0, records_salvaged)
+            if cause == "auth":
+                ctx.metrics.auth_failures_total += 1
+                ctx.metrics.records_salvaged_after_auth += max(0, records_salvaged)
             ctx.metrics.data_loss_events.append(descriptor)
-            if partition_index not in _data_loss_partitions:
+            _partition_failure_context[partition_index] = {
+                'phase': phase,
+                'query_number': query_number,
+                'block_start': block_start,
+                'block_end': block_end,
+                'activity_type': activity_type,
+                'records_lost': records_lost,
+                'records_salvaged': records_salvaged,
+                'reason': reason,
+                'cause': cause,
+            }
+            if final and partition_index not in _data_loss_partitions:
                 _data_loss_partitions.add(partition_index)
                 ctx.metrics.partitions_with_data_loss += 1
+        if final:
+            write_log(f"[PARTITION DATA LOST] {descriptor}", level="ERROR")
+        else:
+            write_log(f"[PARTITION RETRY-CANDIDATE] {descriptor}", level="WARNING")
+
+    def _finalize_partition_loss(partition_index: int) -> None:
+        """Mark a partition as permanently lost AFTER the end-of-run retry
+        sweep has exhausted its attempts.
+
+        This is a thin wrapper that:
+          * bumps ``partitions_with_data_loss`` exactly once per partition
+            (dedup via ``_data_loss_partitions`` set), and
+          * emits a single greppable ``[PARTITION DATA LOST]`` ERROR line
+            built from the last-seen failure descriptor stashed by
+            ``_record_data_loss``.
+
+        It deliberately does NOT re-bump ``auth_failures_total`` or
+        ``records_salvaged_after_auth`` (those were already counted on the
+        per-attempt ``_record_data_loss(final=False)`` calls) and does NOT
+        re-append to ``data_loss_events`` (the per-attempt descriptors are
+        already there). The goal is one authoritative "lost forever" record
+        per partition — not duplicate accounting on top of the diagnostic
+        retry trail.
+        """
+        ctx_dict = _partition_failure_context.get(partition_index)
+        with _data_loss_lock:
+            if partition_index in _data_loss_partitions:
+                return  # Already finalized (e.g., salvage path beat us to it)
+            _data_loss_partitions.add(partition_index)
+            ctx.metrics.partitions_with_data_loss += 1
+        if ctx_dict:
+            descriptor = (
+                f"p={partition_index} q#{ctx_dict['query_number']} "
+                f"phase={ctx_dict['phase']} cause={ctx_dict['cause']} "
+                f"block={ctx_dict['block_start'].isoformat()}.."
+                f"{ctx_dict['block_end'].isoformat()} "
+                f"activity={ctx_dict['activity_type']} "
+                f"lost={ctx_dict['records_lost']} "
+                f"salvaged={ctx_dict['records_salvaged']} "
+                f"reason=unrecovered after sweep; last error: {ctx_dict['reason']}"
+            )
+        else:
+            descriptor = (
+                f"p={partition_index} reason=unrecovered after sweep "
+                f"(no _query_fn descriptor captured \u2014 orchestrator-path failure)"
+            )
+        # Also append the final verdict to data_loss_events so the pipeline
+        # summary tail and result['data_loss_events'] include it.
+        ctx.metrics.data_loss_events.append(descriptor)
         write_log(f"[PARTITION DATA LOST] {descriptor}", level="ERROR")
+
+    # Backwards-compat alias: existing call sites used auth-specific name.
+    _record_auth_data_loss = _record_data_loss
 
     # Register the main-thread session so _get_thread_session() reuses it
     _thread_sessions[threading.get_ident()] = session
@@ -1371,20 +1502,42 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
             except GraphAuthExpiredError:
                 if _attempt == 0 and _refresh_session_token():
                     continue  # Retry with fresh token
-                # Refresh failed or second attempt failed — block lost.
-                _record_auth_data_loss(
+                # Refresh failed or second attempt failed — surface to the
+                # end-of-run partition retry sweep instead of silently
+                # producing zero records.
+                _record_data_loss(
                     phase="submit",
                     partition_index=p_idx,
                     query_number=q_num,
                     block_start=block_start,
                     block_end=block_end,
                     activity_type=activity_type,
+                    cause="auth",
                     reason="GraphAuthExpiredError during invoke_graph_audit_query",
                 )
-                return None  # Refresh failed or second attempt failed
+                raise PartitionRetryableError(
+                    f"submit auth-failed p={p_idx} q#{q_num}"
+                )
 
         if not query_id:
-            return None
+            write_log(
+                f"  Submit returned no query_id for block "
+                f"{block_start.isoformat()}..{block_end.isoformat()} — surfacing to partition retry sweep",
+                level="ERROR",
+            )
+            _record_data_loss(
+                phase="submit",
+                partition_index=p_idx,
+                query_number=q_num,
+                block_start=block_start,
+                block_end=block_end,
+                activity_type=activity_type,
+                cause="protocol",
+                reason="invoke_graph_audit_query returned None (non-auth submit failure)",
+            )
+            raise PartitionRetryableError(
+                f"submit returned no query_id p={p_idx} q#{q_num}"
+            )
 
         # CHECKPOINT: Save QueryCreated state so resume can skip query creation
         # and go straight to fetch if the server-side query is still alive.
@@ -1446,19 +1599,34 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
                     activity_type=activity_type,
                     reason=f"GraphAuthExpiredError polling query_id={query_id}",
                 )
-                return None
+                raise PartitionRetryableError(
+                    f"poll auth-failed p={p_idx} q#{q_num} qid={query_id[:8]}"
+                )
             except Exception as poll_ex:
                 err_msg = str(poll_ex)
                 is_transient = _is_transient(err_msg)
                 if not is_transient:
                     # Non-transient (e.g., 404 query gone, 400 bad request).
-                    # Surface and exit — orchestrator's partition retry will
-                    # re-submit this block on a later pass.
+                    # Surface to the end-of-run partition retry sweep which
+                    # will re-submit this block with a fresh query_id.
                     write_log(
-                        f"  Poll non-transient error (giving up on query_id={query_id[:8]}): {err_msg}",
+                        f"  Poll non-transient error on query_id={query_id[:8]}, "
+                        f"surfacing to partition retry sweep: {err_msg}",
                         level="ERROR",
                     )
-                    return None
+                    _record_data_loss(
+                        phase="poll",
+                        partition_index=p_idx,
+                        query_number=q_num,
+                        block_start=block_start,
+                        block_end=block_end,
+                        activity_type=activity_type,
+                        cause="protocol",
+                        reason=f"non-transient poll error on query_id={query_id}: {err_msg}",
+                    )
+                    raise PartitionRetryableError(
+                        f"poll non-transient p={p_idx} q#{q_num} qid={query_id[:8]}: {err_msg}"
+                    )
                 # Transient: start/extend outage window.
                 now_mono = _time.monotonic()
                 if outage_started_at is None:
@@ -1468,10 +1636,26 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
                     write_log(
                         f"  [NET] Poll aborted after {outage_elapsed/60:.1f} min "
                         f"of continuous network outage (limit: "
-                        f"{outage_limit_sec/60:.0f} min) for query_id={query_id[:8]}",
+                        f"{outage_limit_sec/60:.0f} min) for query_id={query_id[:8]} — "
+                        f"surfacing to partition retry sweep",
                         level="ERROR",
                     )
-                    return None
+                    _record_data_loss(
+                        phase="poll",
+                        partition_index=p_idx,
+                        query_number=q_num,
+                        block_start=block_start,
+                        block_end=block_end,
+                        activity_type=activity_type,
+                        cause="network",
+                        reason=(
+                            f"network outage exceeded {outage_limit_sec/60:.0f}min "
+                            f"limit on query_id={query_id}: {err_msg}"
+                        ),
+                    )
+                    raise PartitionRetryableError(
+                        f"poll outage p={p_idx} q#{q_num} qid={query_id[:8]}: {err_msg}"
+                    )
                 # Throttled log: first failure, then once per minute.
                 if outage_last_log == 0.0 or (now_mono - outage_last_log) >= 60:
                     write_log(
@@ -1485,15 +1669,46 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
                 continue
 
             if not status_result:
-                return None
+                write_log(
+                    f"  Poll returned no status_result for query_id={query_id[:8]} — surfacing to partition retry sweep",
+                    level="ERROR",
+                )
+                _record_data_loss(
+                    phase="poll",
+                    partition_index=p_idx,
+                    query_number=q_num,
+                    block_start=block_start,
+                    block_end=block_end,
+                    activity_type=activity_type,
+                    cause="protocol",
+                    reason=f"get_graph_audit_query_status returned None for query_id={query_id}",
+                )
+                raise PartitionRetryableError(
+                    f"poll status=None p={p_idx} q#{q_num} qid={query_id[:8]}"
+                )
             status = status_result.get('Status', '')
             record_count = status_result.get('RecordCount', 0)
             if status == 'succeeded':
                 write_log(f"  Query {query_id[:8]}... succeeded ({record_count} records)")
                 break
             if status in ('failed', 'cancelled'):
-                write_log(f"Query {query_id} status: {status}", level="WARN")
-                return None
+                write_log(
+                    f"  Query {query_id[:8]} status={status} — surfacing to partition retry sweep",
+                    level="WARNING",
+                )
+                _record_data_loss(
+                    phase="poll",
+                    partition_index=p_idx,
+                    query_number=q_num,
+                    block_start=block_start,
+                    block_end=block_end,
+                    activity_type=activity_type,
+                    cause="protocol",
+                    reason=f"server returned status='{status}' for query_id={query_id}",
+                )
+                raise PartitionRetryableError(
+                    f"poll status={status} p={p_idx} q#{q_num} qid={query_id[:8]}"
+                )
 
             # Heartbeat logging every 5 minutes (PS: heartbeat per StatusIntervalSeconds)
             elapsed_min = int((_time.monotonic() - poll_start) / 60)
@@ -1559,6 +1774,7 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
                             activity_type=activity_type,
                             records_salvaged=len(salvaged),
                             reason="in-loop refresh exhausted; nextLink not resumable",
+                            final=True,
                         )
                         raw_records = salvaged
                         break
@@ -1579,6 +1795,7 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
                     activity_type=activity_type,
                     records_salvaged=len(salvaged),
                     reason="refresh failed after AUTH-401 during pagination",
+                    final=True,
                 )
                 break  # Refresh failed
 
@@ -1881,14 +2098,12 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
                         normalized = convert_from_graph_audit_record(raw_page)
                         if not normalized:
                             return
-                        if not _registered[0]:
-                            # Wipe any partial output left over from a prior
-                            # failed pass on this same partition (retry-mode
-                            # safety). The orchestrator restarts the window
-                            # from scratch on retry, so duplicates would be
-                            # introduced if we just appended.
-                            with open(_path, "w", encoding="utf-8"):
-                                pass
+                        # PS parity: append (do NOT truncate) on first page
+                        # of a retry. Phase 6 drainage dedups by RecordId/Id
+                        # via seen_ids, so overlap from a prior failed pass
+                        # is filtered there. Truncating would discard records
+                        # the previous attempt already wrote if THIS retry
+                        # crashed before its first flush.
                         n = _append_records_to_jsonl(normalized, fpath=_path)
                         if n <= 0:
                             return
@@ -2219,16 +2434,15 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
                 failed_partitions = still_failed
 
             if failed_partitions:
+                # Authoritative data-loss accounting: only partitions still
+                # failed AFTER the sweep are counted in partitions_with_data_loss.
+                # Per-attempt failures recorded earlier (final=False) did NOT
+                # bump the counter so transient errors recovered by the sweep
+                # don't inflate the metric. Use _finalize_partition_loss so
+                # auth/salvage counters are not double-bumped (they were
+                # already counted on the per-attempt _record_data_loss calls).
                 for p_start, p_end, p_idx in failed_partitions:
-                    write_log(
-                        f"  [PARTITION DATA LOST] Partition {p_idx}/{num_partitions} "
-                        f"failed after {max_attempts} attempts: window={p_start} -> {p_end}",
-                        level="ERROR",
-                    )
-                    try:
-                        _data_loss_partitions.add(p_idx)
-                    except Exception:
-                        pass
+                    _finalize_partition_loss(p_idx)
 
     # Close per-thread sessions
     for s in _thread_sessions.values():
@@ -2533,14 +2747,56 @@ def _run_delta_export(ctx: PAXRunContext) -> None:
                 bearer_token=bearer,
             )
 
-        if isinstance(result, dict) and result.get("success", True):
-            rows = result.get("rows_written", 0)
+        # PS parity: a Delta write failure is data-loss equivalent — the CSV
+        # exists on disk under Files/pax/csv/<run_id>/ but Power BI sees
+        # nothing new. Surface failure explicitly and bump
+        # partitions_with_data_loss so pipeline.run() flips success=False
+        # instead of reporting clean.
+        #
+        # Two return shapes must be handled (mod16 contract):
+        #   * write_delta_append: always sets {"success": bool, "error": str|None, ...}
+        #   * convert_csv_to_delta: on success returns {"rows_written", "columns",
+        #     "target_uri"} with NO "success" key; on internal failure raises.
+        # So treat absence-of-error AND absence-of-explicit-False as success.
+        if not isinstance(result, dict):
+            success = False
+            err_msg = f"Delta write returned non-dict result: {result!r}"
+        else:
+            err_msg = result.get("error") or ""
+            explicit_success = result.get("success")
+            if err_msg or explicit_success is False:
+                success = False
+            else:
+                success = True
+
+        if success:
+            rows = result.get("rows_written", 0) if isinstance(result, dict) else 0
             write_log(f"Delta export: {rows} rows written to {target_uri}")
-        elif isinstance(result, dict) and result.get("error"):
-            write_log(f"Delta export failed: {result['error']}", level="ERROR")
+        else:
+            if not err_msg:
+                err_msg = f"Delta write returned non-success result: {result!r}"
+            write_log(
+                f"Delta export FAILED \u2014 CSV preserved at "
+                f"{ctx.output_file}; re-run drain to retry. Error: {err_msg}",
+                level="ERROR",
+            )
+            ctx.metrics.data_loss_events.append(
+                f"delta_export_failed target={target_uri} "
+                f"csv={ctx.output_file} err={err_msg}"
+            )
+            ctx.metrics.partitions_with_data_loss += 1
 
     except Exception as ex:
-        write_log(f"Delta export error: {ex}", level="ERROR")
+        write_log(
+            f"Delta export FAILED with exception \u2014 CSV preserved at "
+            f"{ctx.output_file}; re-run drain to retry. Error: {ex}",
+            level="ERROR",
+        )
+        ctx.metrics.data_loss_events.append(
+            f"delta_export_exception csv={ctx.output_file} "
+            f"err={type(ex).__name__}: {ex}"
+        )
+        ctx.metrics.partitions_with_data_loss += 1
 
 
 def _export_entra_users_only(ctx: PAXRunContext) -> None:

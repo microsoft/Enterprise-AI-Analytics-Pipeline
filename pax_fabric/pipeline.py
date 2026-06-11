@@ -762,7 +762,30 @@ def run(params: Optional[dict] = None) -> dict:
                 rows_written += len(pending_rows)
                 pending_rows.clear()
 
-            for record in _iter_jsonl_shards(spilled_shards):
+            def _on_corrupt_jsonl(shard_path: str, line_no: int, error: str) -> None:
+                """Loud-log callback: record a data-loss event when JSONL parsing fails.
+
+                Signature matches ``_iter_jsonl_shards`` which calls
+                ``on_corrupt_line(path, line_no, str(ex))``. A previous 4-arg
+                signature here raised TypeError that the iterator silently
+                swallowed, so corruption was logged at ERROR level but never
+                surfaced as a data_loss_event \u2014 leaving the run reporting
+                success while rows were dropped.
+
+                PS-parity: a single corrupt line is soft-loss \u2014 it is
+                appended to ``data_loss_events`` for operator review but does
+                NOT bump ``partitions_with_data_loss`` (which tracks hard
+                partition loss, i.e. a whole partition that failed retry
+                sweep or a Delta drain crash).
+                """
+                ctx.metrics.data_loss_events.append(
+                    f"jsonl_corrupt_line shard={Path(shard_path).name} "
+                    f"line={line_no} err={error}"
+                )
+
+            for record in _iter_jsonl_shards(
+                spilled_shards, on_corrupt_line=_on_corrupt_jsonl
+            ):
                 rid = (
                     record.get("Identity")
                     or record.get("Id")
@@ -859,14 +882,34 @@ def run(params: Optional[dict] = None) -> dict:
                 f"Draining {csv_root} -> Tables/{target_schema}/ "
                 f"(run_id={run_id})"
             )
-            delta_results = delta_writer.csv_dir_to_delta(
-                csv_dir=csv_root,
-                schema=target_schema,
-                run_id=run_id,
-                write_mode="append",
-                name_overrides=name_overrides,
-                log_fn=lambda msg, lvl="INFO": write_log(msg, level=lvl),
-            )
+
+            # Notebook flow drains via csv_dir_to_delta() here — NOT through
+            # __main__._run_delta_export(). Wrap in try/except so a network
+            # blip / schema mismatch / OneLake throttle is logged as data
+            # loss instead of raising past pipeline.run()'s accounting.
+            # CSVs remain on disk under csv_root for re-drain.
+            delta_results: list = []
+            try:
+                delta_results = delta_writer.csv_dir_to_delta(
+                    csv_dir=csv_root,
+                    schema=target_schema,
+                    run_id=run_id,
+                    write_mode="append",
+                    name_overrides=name_overrides,
+                    log_fn=lambda msg, lvl="INFO": write_log(msg, level=lvl),
+                )
+            except Exception as ex:
+                write_log(
+                    f"Delta drain FAILED with exception \u2014 CSVs preserved at "
+                    f"{csv_root}; re-run drain to retry. Error: {ex}",
+                    level="ERROR",
+                )
+                ctx.metrics.data_loss_events.append(
+                    f"delta_drain_exception csv_root={csv_root} "
+                    f"err={type(ex).__name__}: {ex}"
+                )
+                ctx.metrics.partitions_with_data_loss += 1
+
             result["delta_tables"] = delta_results
             write_log(
                 f"Delta drain complete: {len(delta_results)} table(s) written."
@@ -1083,6 +1126,21 @@ def run(params: Optional[dict] = None) -> dict:
             result["partitions_with_data_loss"] = loss_parts
             result["records_salvaged_after_auth"] = salvaged
             result["data_loss_events"] = list(getattr(m, "data_loss_events", []))
+
+        # PowerShell parity: data loss is logged loudly but does NOT flip
+        # success. PS writes a red WARNING and continues; operator inspects
+        # `data_loss_detected`, `partitions_with_data_loss`, and
+        # `data_loss_events` in the result dict (and [PARTITION DATA LOST]
+        # entries in the log) to decide whether to re-run / resume.
+        if loss_parts > 0:
+            write_log(
+                f"[DATA LOSS WARNING] Run completed with unrecovered data "
+                f"loss in {loss_parts} partition(s) after retry sweep "
+                f"exhausted; see [PARTITION DATA LOST] entries above. "
+                f"success=True per PowerShell-parity policy \u2014 inspect "
+                f"result['data_loss_events'] to decide whether to re-run.",
+                level="ERROR",
+            )
 
         loss_suffix = ""
         if auth_fail or loss_parts:
