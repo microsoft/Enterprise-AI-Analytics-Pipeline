@@ -17,14 +17,31 @@ from typing import Any, Callable, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Transient network error patterns (matches PS $transientPatterns)
+# Transient network error patterns (matches PS $transientPatterns + HTTP 5xx)
 # ---------------------------------------------------------------------------
 TRANSIENT_PATTERNS: List[str] = [
+    # Network-layer
     'timed out',
+    'timeout',
     'unable to connect',
     'connection',
     'remote name could not be resolved',
     'temporarily unavailable',
+    'broken pipe',
+    'reset by peer',
+    # HTTP 5xx — always safe to retry idempotent reads (status polls, paged GETs)
+    '500',
+    '502',
+    '503',
+    '504',
+    'internal server error',
+    'bad gateway',
+    'service unavailable',
+    'gateway timeout',
+    # Throttling / quota
+    '429',
+    'throttl',
+    'too many requests',
 ]
 
 
