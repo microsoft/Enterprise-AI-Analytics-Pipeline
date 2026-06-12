@@ -77,12 +77,6 @@ _DEFAULT_DELTA_MAX_ATTEMPTS = 4
 _DEFAULT_DELTA_BASE_DELAY_SEC = 2.0
 _DEFAULT_DELTA_MAX_DELAY_SEC = 60.0
 
-# Maximum number of columns that may be auto-dropped from an existing Delta
-# table when the incoming CSV is missing them. Cap exists so a buggy/empty
-# upstream CSV cannot silently shrink a healthy table to a few columns.
-# Above this threshold the write is refused with [SCHEMA_DRIFT_TOO_LARGE].
-_MAX_AUTO_DROP_COLUMNS = 2
-
 # Substrings (case-insensitive) that mark an exception as worth retrying.
 
 # Covers ABFSS HTTP errors, network/timeout errors, Delta concurrent-commit
@@ -992,50 +986,14 @@ def write_delta_append(
 
     # Step 2: Auto-reconcile destructive drift. PS L8210-8214 originally rejected;
     # we now drop the missing columns from the existing Delta table so the new
-    # CSV's schema becomes the source of truth. A safety cap (_MAX_AUTO_DROP_COLUMNS)
-    # still rejects writes that would drop "too many" columns at once -- those are
-    # almost always upstream bugs (truncated/empty CSVs), not intentional schema
-    # changes. Delta time-travel preserves the pre-drop version for ~7 days, so
-    # an accidental drop is recoverable via DeltaTable(uri).restore(version=N).
+    # CSV's schema becomes the source of truth, regardless of how many columns
+    # are missing. Delta time-travel preserves the pre-drop version for ~7 days,
+    # so an accidental drop is recoverable via DeltaTable(uri).restore(version=N).
     dropped_cols: list[str] = []
     if not probe["compatible"] and not is_init:
         missing_cols = list(probe.get("missing", []))
         missing_list = ', '.join(missing_cols)
 
-        if len(missing_cols) > _MAX_AUTO_DROP_COLUMNS:
-            msg = (
-                f"Write-DeltaAppend: refusing to auto-drop {len(missing_cols)} "
-                f"columns from '{table_name}' (cap is {_MAX_AUTO_DROP_COLUMNS}). "
-                f"Existing column(s) not in source CSV: {missing_list}"
-            )
-            log.error(msg)
-            if log_fn:
-                log_fn(
-                    f"Delta write '{table_name}' FAILED [SCHEMA_DRIFT_TOO_LARGE]: {msg}",
-                    "ERROR",
-                )
-                log_fn(
-                    f"Delta write '{table_name}' \u2192 More than "
-                    f"{_MAX_AUTO_DROP_COLUMNS} existing columns are missing "
-                    "from the new CSV. This is almost always a truncated or "
-                    "empty upstream export rather than a deliberate schema "
-                    "change, so the write is refused to prevent silent data "
-                    "loss. Inspect the CSV under Files/pax/csv/<run_id>/; if "
-                    "the change is intentional, raise _MAX_AUTO_DROP_COLUMNS "
-                    "in mod16_pax_delta.py.",
-                    "ERROR",
-                )
-            return {
-                "success": False,
-                "is_init": False,
-                "added_cols": [],
-                "missing": missing_cols,
-                "error": f"[SCHEMA_DRIFT_TOO_LARGE] {msg}",
-                "error_category": "SCHEMA_DRIFT_TOO_LARGE",
-                "rows_written": 0,
-            }
-
-        # Within cap -- attempt the auto-drop.
         if log_fn:
             log_fn(
                 f"Delta write '{table_name}' AUTO_DROP: removing "
