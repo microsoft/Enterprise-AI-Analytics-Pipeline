@@ -1714,7 +1714,7 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
             elapsed_min = int((_time.monotonic() - poll_start) / 60)
             if elapsed_min != last_log_minute and elapsed_min % 5 == 0:
                 last_log_minute = elapsed_min
-                write_log(f"  ... {elapsed_min} min elapsed, status={status}")
+                write_log(f"  [p={p_idx}/{p_tot} q#{q_num} id={query_id[:8]}] ... {elapsed_min} min elapsed, status={status}")
 
             # Gentle backoff: 15s -> 30s -> 60s (PS L11555-11556)
             if elapsed_min >= 10 and poll_interval < 60:
