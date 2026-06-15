@@ -538,11 +538,16 @@ def get_graph_audit_records(
     # 404/410 mean Graph dropped the query state — no point retrying the
     # same nextLink; let the block restart from query submit.
 
-    # Progress visibility: log every N pages (or every 30s) so the user can
-    # see that paging is making forward progress. Without this a multi-minute
-    # fetch with no errors looks like a hang.
+    # Progress visibility: log every N pages (or every 30/60s) so the user
+    # can see that paging is making forward progress. Without this a
+    # multi-minute fetch with no errors looks like a hang.
+    # The interval is ADAPTIVE: starts at every 10 pages for early visibility,
+    # then widens to every 30 (after 100 pages) and every 50 (after 300
+    # pages) to keep log files manageable on high-volume runs.  Critical
+    # events (page 1, final page, retries, errors) are always logged.
     page_num = 0
-    log_every_pages = 10
+    _LOG_TIERS = ((100, 10), (300, 30))   # (threshold, interval)
+    _LOG_TIER_DEFAULT = 50                # interval after all thresholds
     fetch_start = time.monotonic()
     last_progress_log = fetch_start
     # Prefix tag like "[p=1/2 q#1 id=b462c36a] " — empty if caller didn't pass one.
@@ -601,14 +606,20 @@ def get_graph_audit_records(
             # Check for pagination
             uri = data.get("@odata.nextLink")
 
-            # Progress visibility: log every N pages OR every 30s, whichever
+            # Progress visibility: log every N pages OR every 60s, whichever
             # comes first. Also log when pagination ends (final page).
+            # Interval widens adaptively as page count grows.
             now = time.monotonic()
             page_elapsed = now - page_start
+            log_every_pages = _LOG_TIER_DEFAULT
+            for _thresh, _interval in _LOG_TIERS:
+                if page_num <= _thresh:
+                    log_every_pages = _interval
+                    break
             should_log = (
                 page_num == 1
                 or page_num % log_every_pages == 0
-                or (now - last_progress_log) >= 30.0
+                or (now - last_progress_log) >= 60.0
                 or uri is None  # last page
             )
             if should_log:

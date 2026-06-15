@@ -184,7 +184,7 @@ class PAXConfig:
     block_hours: float = 0.5
     partition_hours: int = 0
     max_partitions: int = 160
-    result_size: int = 50000
+    result_size: int = 10000
     pacing_ms: int = 0
     max_concurrency: int = 10
 

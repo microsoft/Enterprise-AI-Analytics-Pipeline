@@ -28,6 +28,7 @@ import logging
 import os
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime
 from typing import Any, Optional
@@ -62,6 +63,14 @@ _original_weights: Optional[dict[str, float]] = {"Parsing": 0.05, "Query": 0.85,
 # Fabric package uses a distinct logger name so notebook-side handlers can
 # attach without colliding with any legacy ``pax`` logger left in the kernel.
 _logger = logging.getLogger("pax_fabric")
+
+# Thread lock for stdout writes.  Fabric / Jupyter notebooks replace
+# sys.stdout with a custom stream that funnels output through the IOPub
+# ZMQ channel.  When multiple threads (e.g. parallel Graph partitions)
+# write concurrently, the kernel may silently drop messages or interleave
+# partial lines.  Serializing all stdout writes behind one lock AND
+# flushing immediately afterwards eliminates this class of output loss.
+_stdout_lock = threading.Lock()
 
 
 # ===========================================================================
@@ -115,8 +124,9 @@ def write_log(message: str, level: str = "INFO") -> None:
     ts = _timestamp()
     log_entry = f"[{ts}] [{level}] {message}"
 
-    # Echo to console (PS: Microsoft.PowerShell.Utility\Write-Host)
-    print(message)
+    # Echo to console — serialized + flushed to avoid notebook output loss
+    with _stdout_lock:
+        print(message, flush=True)
 
     # Write to file or buffer
     _write_to_log_file(log_entry)
@@ -181,12 +191,13 @@ def write_log_host(message: str, foreground_color: str = "White") -> None:
         message: The message to display and log.
         foreground_color: PS ConsoleColor name (e.g., 'Green', 'Red', 'Yellow').
     """
-    # Colored console output
+    # Colored console output — serialized + flushed
     color_code = _ANSI_COLORS.get(foreground_color, "")
-    if color_code and sys.stdout.isatty():
-        print(f"{color_code}{message}{_ANSI_RESET}")
-    else:
-        print(message)
+    with _stdout_lock:
+        if color_code and sys.stdout.isatty():
+            print(f"{color_code}{message}{_ANSI_RESET}", flush=True)
+        else:
+            print(message, flush=True)
 
     # Write to log file
     ts = _timestamp()
@@ -311,6 +322,33 @@ def migrate_bootstrap_log(final_log_path: str) -> None:
     _log_file_is_bootstrap = False
 
 
+class _FlushingStreamHandler(logging.Handler):
+    """Handler that routes logger output through ``print()`` — the same
+    code path that ``write_log()`` uses — so both streams are treated
+    identically by Jupyter / Fabric notebook kernels.
+
+    Background: Jupyter replaces ``sys.stdout`` with a custom OutStream
+    backed by a ZMQ IOPub channel.  ``print()`` is handled as a
+    first-class operation and flushed immediately, but direct
+    ``sys.stdout.write()`` calls (as used by stdlib StreamHandler) can
+    be deferred or batched into a separate output group.  This causes
+    ``write_log()`` output and ``logger.info()`` output to appear as
+    two non-interleaved blocks instead of chronological order.
+
+    By using ``print(flush=True)`` under the same ``_stdout_lock``,
+    this handler's output merges seamlessly with ``write_log()`` output
+    in the notebook cell, preserving chronological ordering.
+    """
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+            with _stdout_lock:
+                print(msg, flush=True)
+        except Exception:
+            self.handleError(record)
+
+
 def setup_host_logging(log_file_path: str) -> None:
     """
     Initialize the logging system with a file path.
@@ -343,12 +381,23 @@ def setup_host_logging(log_file_path: str) -> None:
                                            datefmt="%Y-%m-%d %H:%M:%S"))
     _logger.addHandler(handler)
 
-    # Also add a stream handler for console
-    stream_handler = logging.StreamHandler(sys.stdout)
+    # Console handler: uses _FlushingStreamHandler (print-based) so output
+    # from logger.info() and write_log() merges in chronological order
+    # inside Jupyter / Fabric notebook cells.
+    stream_handler = _FlushingStreamHandler()
     stream_handler.setFormatter(logging.Formatter("%(message)s"))
     _logger.addHandler(stream_handler)
 
     _logger.setLevel(logging.DEBUG)
+
+    # CRITICAL: Stop propagation to the root logger.  Fabric / Jupyter
+    # runtimes install their own handler on the root logger that writes
+    # to a separate IOPub output stream.  Without this, every logger.info()
+    # message from child modules (mod5, mod7, mod11 …) propagates up to
+    # both our handler (→ print → stdout → top block) AND the root
+    # handler (→ separate stream → bottom block), causing the notebook
+    # output to be split into two non-chronological sections.
+    _logger.propagate = False
 
 
 # ===========================================================================
