@@ -1714,7 +1714,7 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
             elapsed_min = int((_time.monotonic() - poll_start) / 60)
             if elapsed_min != last_log_minute and elapsed_min % 5 == 0:
                 last_log_minute = elapsed_min
-                write_log(f"  [p={p_idx}/{p_tot} q#{q_num} id={query_id[:8]}] ... {elapsed_min} min elapsed, status={status}")
+                write_log(f"  ... {elapsed_min} min elapsed, status={status}")
 
             # Gentle backoff: 15s -> 30s -> 60s (PS L11555-11556)
             if elapsed_min >= 10 and poll_interval < 60:
@@ -3006,23 +3006,38 @@ def _cleanup(ctx: PAXRunContext) -> None:
     except Exception:
         pass
 
-    # Remove checkpoint on success
+    # Remove checkpoint only when every planned partition completed.
     if ctx.script_completed:
-        try:
-            remove_checkpoint()
-        except Exception:
-            pass
+        cp_data = get_checkpoint_data() or {}
+        cp_parts = cp_data.get("partitions", {}) if isinstance(cp_data, dict) else {}
+        cp_stats = cp_data.get("statistics", {}) if isinstance(cp_data, dict) else {}
+        total_partitions = int(cp_parts.get("total") or 0)
+        completed_partitions = int(cp_stats.get("partitionsComplete") or 0)
+        should_remove_checkpoint = (
+            total_partitions > 0 and completed_partitions >= total_partitions
+        )
 
-        # Remove Fabric resume mirror on clean exit (PS L11411)
-        if ctx.dest_tier.get("Purview") == "Fabric":
+        if should_remove_checkpoint:
             try:
-                remove_fabric_resume_mirror(
-                    run_timestamp=ctx.config.script_run_timestamp or "",
-                    fabric_target=ctx.fabric_target,
-                    delete_fn=lambda *a, **k: None,
-                )
+                remove_checkpoint()
             except Exception:
                 pass
+
+            # Remove Fabric resume mirror only when checkpoint is deleted.
+            if ctx.dest_tier.get("Purview") == "Fabric":
+                try:
+                    remove_fabric_resume_mirror(
+                        run_timestamp=ctx.config.script_run_timestamp or "",
+                        fabric_target=ctx.fabric_target,
+                        delete_fn=lambda *a, **k: None,
+                    )
+                except Exception:
+                    pass
+        else:
+            write_log(
+                "Checkpoint preserved: not all partitions completed; resume is available.",
+                level="WARNING",
+            )
 
     # Emit summary
     _emit_summary(ctx)
