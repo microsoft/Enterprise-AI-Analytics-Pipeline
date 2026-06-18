@@ -110,15 +110,43 @@ def _extract_retry_after_seconds(exc: BaseException) -> Optional[float]:
 
 
 def _is_throttling_exception(exc: BaseException) -> bool:
-    """Return True if `exc` represents an HTTP 429 / 503 throttling response."""
+    """Return True if `exc` represents an HTTP 429 throttling response."""
     status = getattr(exc, "status_code", None)
     if status is None:
         resp = getattr(exc, "response", None)
         status = getattr(resp, "status_code", None) if resp is not None else None
-    if isinstance(status, int) and status in (429, 503):
+    if isinstance(status, int) and status == 429:
         return True
     msg = str(exc)
     return ("429" in msg) or ("Too Many Requests" in msg) or ("TooManyRequests" in msg)
+
+
+def _is_network_outage_exception(exc: BaseException) -> bool:
+    """Return True for transient network / gateway-class failures."""
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        resp = getattr(exc, "response", None)
+        status = getattr(resp, "status_code", None) if resp is not None else None
+    if isinstance(status, int) and status in (500, 502, 503, 504):
+        return True
+    msg = str(exc).lower()
+    return any(
+        token in msg
+        for token in (
+            "timed out",
+            "timeout",
+            "unable to connect",
+            "connection",
+            "remote name could not be resolved",
+            "temporarily unavailable",
+            "broken pipe",
+            "reset by peer",
+            "internal server error",
+            "bad gateway",
+            "service unavailable",
+            "gateway timeout",
+        )
+    )
 
 
 # =============================================================================
@@ -496,6 +524,7 @@ def invoke_activity_time_window_processing(
     backoff_max_seconds: int = 45,
     circuit_breaker_threshold: int = 5,
     circuit_breaker_cooldown_seconds: int = 120,
+    max_network_outage_minutes: int = 30,
     throttle_min_wait_seconds: float = 30.0,
     throttle_max_wait_seconds: float = 180.0,
     respect_retry_after: bool = True,
@@ -598,6 +627,8 @@ def invoke_activity_time_window_processing(
     block_number = 1
     query_number = 0  # increments per Graph query attempt within this partition
     _throttle_retries = 0  # per-block 429/503 retry counter (PS: while -not $createSuccess)
+    network_outage_started_at: Optional[float] = None
+    max_outage_seconds = max(60, int(max_network_outage_minutes) * 60)
 
     while current < end_date:
         # --- Circuit breaker check ---
@@ -686,15 +717,18 @@ def invoke_activity_time_window_processing(
                     _block_count, True, result_size,
                 )
                 state.consecutive_block_failures = 0
+                network_outage_started_at = None
             else:
                 logger.info(
                     f"[BLOCK {block_number}] done: 0 records returned"
                 )
                 state.consecutive_block_failures = 0
+                network_outage_started_at = None
 
         except Exception as e:
             _err_tag = _classify_exception(e)
             _is_throttle = _is_throttling_exception(e)
+            _is_network = _is_network_outage_exception(e)
             _retry_after = _extract_retry_after_seconds(e) if respect_retry_after else None
             logger.warning(f"    Block failed [{_err_tag}]: {e}")
             # Don't punish learned block size for rate-limit failures — 429 is a
@@ -739,6 +773,24 @@ def invoke_activity_time_window_processing(
                 sleep_seconds = exp_delay
                 reason_detail = _err_tag
 
+            if _is_network and not _is_throttle:
+                if network_outage_started_at is None:
+                    network_outage_started_at = _time.monotonic()
+                outage_elapsed = _time.monotonic() - network_outage_started_at
+                if outage_elapsed < max_outage_seconds:
+                    sleep_seconds = random.uniform(30.0, 60.0)
+                    reason_detail = (
+                        f"{_err_tag}, network outage {outage_elapsed / 60.0:.1f}m/"
+                        f"{max_outage_seconds / 60.0:.0f}m"
+                    )
+                else:
+                    logger.error(
+                        "    [NETWORK] Block failed for %.1fm (limit %.0fm) — surfacing failure instead of subdividing",
+                        outage_elapsed / 60.0,
+                        max_outage_seconds / 60.0,
+                    )
+                    raise
+
             total_delay_sec = round(sleep_seconds, 2) + round(jitter_ms / 1000, 2)
 
             if metrics is not None:
@@ -759,13 +811,14 @@ def invoke_activity_time_window_processing(
             # advancing past a throttled block would silently lose its data.
             if _is_throttle:
                 if _throttle_retries >= 20:
-                    logger.warning(
-                        f"    Throttle retry cap reached ({_throttle_retries} attempts) "
-                        f"for block {block_number} – advancing past block"
+                    raise TimeoutError(
+                        f"Block {block_number} exhausted {_throttle_retries} throttle retries"
                     )
-                    # Fall through to progress update + cursor advance below
                 else:
                     continue  # Retry the same block from top of while loop
+
+            if _is_network and not _is_throttle:
+                continue  # Retry same block while outage window remains open
 
             # Check circuit breaker
             if state.consecutive_block_failures >= circuit_breaker_threshold:
@@ -788,7 +841,7 @@ def invoke_activity_time_window_processing(
             # makes the situation worse. The exponential/Retry-After sleep
             # above is the correct response; the outer loop will simply retry
             # the same block on the next iteration.
-            if block_hours > 0.5 and not _is_throttle:
+            if block_hours > 0.5 and not _is_throttle and not _is_network:
                 smaller_block_hours = get_next_smaller_block_size(block_hours)
                 logger.info(
                     f"    Retrying with smaller {smaller_block_hours} hour block..."
@@ -1044,6 +1097,7 @@ def invoke_partition_graph_processing(
     total_partitions: int = 1,
     backoff_base_seconds: float = 1.0,
     backoff_max_seconds: int = 45,
+    max_network_outage_minutes: int = 30,
     throttle_min_wait_seconds: float = 30.0,
     throttle_max_wait_seconds: float = 180.0,
     respect_retry_after: bool = True,
@@ -1125,6 +1179,8 @@ def invoke_partition_graph_processing(
     all_records: List[Dict[str, Any]] = []
     throttle_retries = 0
     max_throttle_retries = 20  # PS parity: up to 20 in-place 429 retries
+    network_outage_started_at: Optional[float] = None
+    max_outage_seconds = max(60, int(max_network_outage_minutes) * 60)
 
     while True:
         # Honor process-wide throttle deadline before issuing the query.
@@ -1156,6 +1212,7 @@ def invoke_partition_graph_processing(
         except Exception as exc:
             err_tag = _classify_exception(exc)
             is_throttle = _is_throttling_exception(exc)
+            is_network = _is_network_outage_exception(exc)
             retry_after = _extract_retry_after_seconds(exc) if respect_retry_after else None
             logger.warning(
                 f"  Partition {partition_index}/{total_partitions} query failed "
@@ -1185,6 +1242,32 @@ def invoke_partition_graph_processing(
                 )
                 sleep_fn(math.ceil(sleep_seconds) + jitter)
                 continue  # retry same partition window
+
+            if is_network:
+                if network_outage_started_at is None:
+                    network_outage_started_at = _time.monotonic()
+                outage_elapsed = _time.monotonic() - network_outage_started_at
+                if outage_elapsed < max_outage_seconds:
+                    delay = random.uniform(30.0, 60.0)
+                    if metrics is not None:
+                        metrics.backoff_total_delay_seconds += delay
+                    logger.info(
+                        "  Reliability: Network outage retry in %.1fs (elapsed %.1fm / %.0fm, reason=%s)",
+                        delay,
+                        outage_elapsed / 60.0,
+                        max_outage_seconds / 60.0,
+                        err_tag,
+                    )
+                    sleep_fn(delay)
+                    continue
+                return {
+                    'status': 'failed',
+                    'record_count': record_counter[0],
+                    'error': (
+                        f"network outage exceeded {max_network_outage_minutes}min: "
+                        f"{err_tag}: {exc}"
+                    ),
+                }
 
             # Non-throttle error or throttle retry cap exhausted: return failed.
             return {
