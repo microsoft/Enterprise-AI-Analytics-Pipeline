@@ -74,6 +74,7 @@ from .mod6_pax_checkpoint import (
 )
 from .mod7_pax_graph_api import (
     GraphAuthExpiredError,
+    GraphForbiddenError,
     set_m365_usage_activity_bundle,
     detect_graph_audit_api_version,
     invoke_graph_audit_query,
@@ -1443,6 +1444,33 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
             return _refresh_session_token()
         return True
 
+    def _extract_retry_after_seconds(exc: BaseException) -> float | None:
+        """Best-effort Retry-After extraction for poll-time throttle handling."""
+        resp = getattr(exc, "response", None)
+        if resp is None:
+            return None
+        headers = getattr(resp, "headers", None)
+        if not headers:
+            return None
+        raw = headers.get("Retry-After") or headers.get("retry-after")
+        if not raw:
+            return None
+        raw = str(raw).strip()
+        try:
+            return max(0.0, float(raw))
+        except (TypeError, ValueError):
+            pass
+        try:
+            from email.utils import parsedate_to_datetime
+            dt = parsedate_to_datetime(raw)
+            if dt is None:
+                return None
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return max(0.0, (dt - datetime.now(timezone.utc)).total_seconds())
+        except Exception:
+            return None
+
     def _query_fn(block_start, block_end, activity_type, result_size, user_ids, use_eom_mode, log_ctx=None, *, page_callback=None):
         """Submit Graph audit query, poll, retrieve and normalize records.
 
@@ -1484,9 +1512,11 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
 
         display_name = f"PAX_{operations_list[0] if operations_list else 'Query'}_{block_start.strftime('%Y%m%d%H%M')}"
 
-        # Submit query — retry once on 401 (token expired)
+        # Submit query — retry once on 401, and up to 3 times on transient 403.
+        submit_401_retried = False
+        submit_403_retries = 0
         query_id = None
-        for _attempt in range(2):
+        while True:
             try:
                 query_id = invoke_graph_audit_query(
                     display_name=display_name,
@@ -1497,10 +1527,13 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
                     service_types=config.service_types,
                     http_client=http,
                     api_version=api_version,
+                    partition_index=p_idx,
+                    total_partitions=p_tot,
                 )
                 break  # Success (or non-401 failure returning None)
             except GraphAuthExpiredError:
-                if _attempt == 0 and _refresh_session_token():
+                if not submit_401_retried and _refresh_session_token():
+                    submit_401_retried = True
                     continue  # Retry with fresh token
                 # Refresh failed or second attempt failed — surface to the
                 # end-of-run partition retry sweep instead of silently
@@ -1517,6 +1550,34 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
                 )
                 raise PartitionRetryableError(
                     f"submit auth-failed p={p_idx} q#{q_num}"
+                )
+            except GraphForbiddenError as forbid_ex:
+                is_transient_403 = getattr(forbid_ex, 'is_transient', False)
+                if is_transient_403 and submit_403_retries < 3 and _refresh_session_token():
+                    submit_403_retries += 1
+                    delay = min(60.0, 15.0 * (2 ** (submit_403_retries - 1)))
+                    write_log(
+                        f"[AUTH-403] Transient 403 during query submit — retrying in {delay:.1f}s "
+                        f"(attempt {submit_403_retries}/3)",
+                        level="WARN",
+                    )
+                    time.sleep(delay)
+                    continue
+                _record_auth_data_loss(
+                    phase="submit",
+                    partition_index=p_idx,
+                    query_number=q_num,
+                    block_start=block_start,
+                    block_end=block_end,
+                    activity_type=activity_type,
+                    reason=(
+                        "transient 403 retry exhausted during invoke_graph_audit_query"
+                        if is_transient_403 else
+                        "non-transient 403 during invoke_graph_audit_query"
+                    ),
+                )
+                raise PartitionRetryableError(
+                    f"submit 403-failed p={p_idx} q#{q_num}"
                 )
 
         if not query_id:
@@ -1557,6 +1618,8 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
         poll_interval = 15  # PS starts at 15s
         poll_start = _time.monotonic()
         last_log_minute = -1
+        poll_sleep_override: float | None = None
+        poll_403_retries = 0
         # Network-outage tolerance: if poll calls keep raising transient
         # network errors (DNS, connection refused, timeout), give up after
         # config.max_network_outage_minutes rather than spinning forever.
@@ -1564,7 +1627,9 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
         outage_last_log: float = 0.0
         outage_limit_sec = max(60, int(getattr(config, 'max_network_outage_minutes', 30)) * 60)
         while True:
-            _time.sleep(poll_interval)
+            sleep_seconds = poll_sleep_override if poll_sleep_override is not None else poll_interval
+            poll_sleep_override = None
+            _time.sleep(sleep_seconds)
 
             # In-loop proactive refresh removed: it fired every 15-60s for the
             # entire poll duration and produced most of the noise in earlier runs.
@@ -1586,6 +1651,7 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
                     )
                     outage_started_at = None
                     outage_last_log = 0.0
+                poll_403_retries = 0
             except GraphAuthExpiredError:
                 # Token expired during polling — refresh and retry this poll cycle
                 if _refresh_session_token():
@@ -1602,7 +1668,42 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
                 raise PartitionRetryableError(
                     f"poll auth-failed p={p_idx} q#{q_num} qid={query_id[:8]}"
                 )
+            except GraphForbiddenError as forbid_ex:
+                is_transient_403 = getattr(forbid_ex, 'is_transient', False)
+                if is_transient_403 and poll_403_retries < 3 and _refresh_session_token():
+                    poll_403_retries += 1
+                    poll_sleep_override = min(60.0, 15.0 * (2 ** (poll_403_retries - 1)))
+                    write_log(
+                        f"  [AUTH-403] Transient 403 during poll for query_id={query_id[:8]} — "
+                        f"retrying in {poll_sleep_override:.1f}s (attempt {poll_403_retries}/3)",
+                        level="WARN",
+                    )
+                    continue
+                _record_auth_data_loss(
+                    phase="poll",
+                    partition_index=p_idx,
+                    query_number=q_num,
+                    block_start=block_start,
+                    block_end=block_end,
+                    activity_type=activity_type,
+                    reason=(
+                        f"transient 403 retry exhausted while polling query_id={query_id}"
+                        if is_transient_403 else
+                        f"non-transient 403 while polling query_id={query_id}"
+                    ),
+                )
+                raise PartitionRetryableError(
+                    f"poll 403-failed p={p_idx} q#{q_num} qid={query_id[:8]}"
+                )
             except Exception as poll_ex:
+                status_code = getattr(getattr(poll_ex, "response", None), "status_code", None)
+                if status_code == 429:
+                    poll_sleep_override = max(1.0, _extract_retry_after_seconds(poll_ex) or 60.0)
+                    write_log(
+                        f"  [THROTTLE] Poll hit 429 for query_id={query_id[:8]} — retrying in {poll_sleep_override:.1f}s",
+                        level="WARN",
+                    )
+                    continue
                 err_msg = str(poll_ex)
                 is_transient = _is_transient(err_msg)
                 if not is_transient:
@@ -1798,6 +1899,25 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
                     final=True,
                 )
                 break  # Refresh failed
+            except GraphForbiddenError as forbid_ex:
+                is_transient_403 = getattr(forbid_ex, 'is_transient', False)
+                _record_auth_data_loss(
+                    phase="fetch",
+                    partition_index=p_idx,
+                    query_number=q_num,
+                    block_start=block_start,
+                    block_end=block_end,
+                    activity_type=activity_type,
+                    records_salvaged=len(getattr(forbid_ex, "partial_records", []) or []),
+                    reason=(
+                        "transient 403 retry exhausted during pagination"
+                        if is_transient_403 else
+                        "non-transient 403 during pagination"
+                    ),
+                )
+                raise PartitionRetryableError(
+                    f"fetch 403-failed p={p_idx} q#{q_num} qid={query_id[:8]}"
+                )
 
         fetch_elapsed = time.monotonic() - fetch_start
         this_query = len(raw_records) if raw_records else 0
@@ -2148,6 +2268,7 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
                         backoff_max_seconds=config.backoff_max_seconds,
                         circuit_breaker_threshold=config.circuit_breaker_threshold,
                         circuit_breaker_cooldown_seconds=config.circuit_breaker_cooldown_seconds,
+                        max_network_outage_minutes=int(getattr(config, 'max_network_outage_minutes', 30)),
                         throttle_min_wait_seconds=config.throttle_min_wait_seconds,
                         throttle_max_wait_seconds=config.throttle_max_wait_seconds,
                         respect_retry_after=config.respect_retry_after,
@@ -2178,6 +2299,7 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
                         total_partitions=p_total,
                         backoff_base_seconds=config.backoff_base_seconds,
                         backoff_max_seconds=config.backoff_max_seconds,
+                        max_network_outage_minutes=int(getattr(config, 'max_network_outage_minutes', 30)),
                         throttle_min_wait_seconds=config.throttle_min_wait_seconds,
                         throttle_max_wait_seconds=config.throttle_max_wait_seconds,
                         respect_retry_after=config.respect_retry_after,

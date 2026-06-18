@@ -76,6 +76,63 @@ class GraphAuthExpiredError(Exception):
     pass
 
 
+class GraphForbiddenError(Exception):
+    """Raised when a Graph API call receives HTTP 403 Forbidden."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        is_transient: bool,
+        partial_records: Optional[List[Dict[str, Any]]] = None,
+    ):
+        super().__init__(message)
+        self.is_transient = is_transient
+        self.partial_records = partial_records or []
+
+
+def _is_transient_403(exc: BaseException) -> bool:
+    """Best-effort classifier for retryable 403 claims/CAE responses."""
+    resp = getattr(exc, "response", None)
+    msg_parts: list[str] = [str(exc)]
+    if resp is not None:
+        try:
+            www_auth = resp.headers.get("WWW-Authenticate")
+            if www_auth:
+                msg_parts.append(str(www_auth))
+        except Exception:
+            pass
+        try:
+            if getattr(resp, "text", None):
+                msg_parts.append(str(resp.text))
+        except Exception:
+            pass
+    msg = " ".join(msg_parts).lower()
+
+    transient_markers = (
+        "claims=",
+        "insufficient_claims",
+        "claims challenge",
+        "claimschallenge",
+        "continuous access evaluation",
+        "conditional access",
+        "cae",
+    )
+    permanent_markers = (
+        "authorization_requestdenied",
+        "insufficient privileges",
+        "insufficient privilege",
+        "access denied",
+        "permission",
+    )
+
+    if any(marker in msg for marker in transient_markers):
+        return True
+    if any(marker in msg for marker in permanent_markers):
+        return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Module-level state
 # ---------------------------------------------------------------------------
@@ -215,6 +272,8 @@ def invoke_graph_audit_query(
     http_client: Any = None,
     api_version: str = "v1.0",
     get_uri_fn: Optional[Callable[[str], str]] = None,
+    partition_index: Optional[int] = None,
+    total_partitions: Optional[int] = None,
 ) -> Optional[str]:
     """
     Submits an asynchronous audit log query to the Microsoft Graph Security API.
@@ -295,7 +354,8 @@ def invoke_graph_audit_query(
         # Emit as ONE atomic log record so parallel partitions don't interleave
         # and both per-partition body blocks survive in the log file.
         body_json = json.dumps(body, indent=2, ensure_ascii=False)
-        _body_log_lines: List[str] = ["[INFO] Graph API Query Body:"]
+        _partition_tag = f" [p={partition_index}/{total_partitions}]" if partition_index is not None and total_partitions is not None else ""
+        _body_log_lines: List[str] = [f"[INFO]{_partition_tag} Graph API Query Body:"]
         if operations and len(operations) > 0:
             _body_log_lines.append(f"  operationFilters: {', '.join(operations)}")
         if effective_record_types and len(effective_record_types) > 0:
@@ -343,12 +403,28 @@ def invoke_graph_audit_query(
                 pass
             raise GraphAuthExpiredError(f"401 Unauthorized on query submit: {e}") from e
 
-        # 429/503 throttling: re-raise so orchestrator can backoff + retry
+        if status_code == 403:
+            is_transient_403 = _is_transient_403(e)
+            logger.warning(
+                "[AUTH-403] Graph audit query rejected — %s 403. "
+                "Raising GraphForbiddenError for caller retry.",
+                "transient" if is_transient_403 else "non-transient",
+            )
+            raise GraphForbiddenError(
+                f"403 Forbidden on query submit: {e}",
+                is_transient=is_transient_403,
+            ) from e
+
+        # 429 throttling: re-raise so orchestrator can backoff + retry
         # the SAME block in-place (PS parity: while -not $createSuccess loop
         # retries up to 20 times on 429).
-        if isinstance(status_code, int) and status_code in (429, 503):
+        if isinstance(status_code, int) and status_code == 429:
             logger.error("[NETWORK] Graph audit query submit failed (throttle-class — caller decides retry): %s", e)
             raise  # Orchestrator will backoff + retry the block
+
+        if isinstance(status_code, int) and status_code in (502, 503, 504):
+            logger.error("[NETWORK] Graph audit query submit failed (gateway-class — caller decides retry): %s", e)
+            raise  # Orchestrator will apply outage tolerance
 
         # Transient network errors: let them propagate so orchestrator can retry.
         # Mirrors PS L17858-18085: network errors → retry within tolerance window.
@@ -438,6 +514,21 @@ def get_graph_audit_query_status(
             logger.warning("[AUTH-401] Graph query status poll rejected — token expired.")
             raise GraphAuthExpiredError(f"401 Unauthorized on status poll: {e}") from e
 
+        if status_code == 403:
+            is_transient_403 = _is_transient_403(e)
+            logger.warning(
+                "[AUTH-403] Graph query status poll rejected — %s 403.",
+                "transient" if is_transient_403 else "non-transient",
+            )
+            raise GraphForbiddenError(
+                f"403 Forbidden on status poll: {e}",
+                is_transient=is_transient_403,
+            ) from e
+
+        if isinstance(status_code, int) and status_code in (429, 502, 503, 504):
+            logger.error("[NETWORK] Graph query status poll failed (retryable HTTP %s — caller decides retry): %s", status_code, e)
+            raise
+
         # Transient network errors: let them propagate so _query_fn's poll loop retries.
         # Mirrors PS L18060-18085: network errors during poll → retry within tolerance.
         # _query_fn catches via `except Exception as poll_ex: continue`.
@@ -513,6 +604,8 @@ def get_graph_audit_records(
 
     auth_retry_count = 0
     max_auth_retries = 2
+    forbidden_retry_count = 0
+    max_forbidden_retries = 3
 
     # ----------------------------------------------------------------------
     # PS parity for page-level retries (Invoke-PartitionGraphProcessing,
@@ -579,6 +672,7 @@ def get_graph_audit_records(
                     )
             auth_retry_count = 0       # Reset on successful page fetch
             throttle_retry_count = 0   # Reset on successful page fetch
+            forbidden_retry_count = 0  # Reset on successful page fetch (PS L23432 parity)
             network_outage_started = None  # Reset outage window on success
             page_num += 1
 
@@ -656,6 +750,41 @@ def get_graph_audit_records(
                 )
                 raise GraphAuthExpiredError(
                     f"401 Unauthorized on record fetch: {e}",
+                    partial_records=list(all_records),
+                ) from e
+
+            if status_code == 403:
+                forbidden_retry_count += 1
+                is_transient_403 = _is_transient_403(e)
+                if (
+                    is_transient_403
+                    and forbidden_retry_count <= max_forbidden_retries
+                    and token_refresh_fn
+                    and token_refresh_fn(True)
+                ):
+                    delay = min(60.0, 15.0 * (2 ** (forbidden_retry_count - 1)))
+                    logger.warning(
+                        "%s[AUTH-403] Transient 403 on page fetch "
+                        "(attempt %d/%d, %d records preserved). "
+                        "Retrying same page in %.1fs after token refresh...",
+                        _pfx, forbidden_retry_count, max_forbidden_retries,
+                        _total_fetched, delay,
+                    )
+                    time.sleep(delay)
+                    continue
+
+                logger.error(
+                    "%s[AUTH-403] Graph record retrieval failed with %s 403 "
+                    "after %d attempt(s) (%d records preserved on retry path): %s",
+                    _pfx,
+                    "transient" if is_transient_403 else "non-transient",
+                    forbidden_retry_count,
+                    _total_fetched,
+                    e,
+                )
+                raise GraphForbiddenError(
+                    f"403 Forbidden on record fetch: {e}",
+                    is_transient=is_transient_403,
                     partial_records=list(all_records),
                 ) from e
 
