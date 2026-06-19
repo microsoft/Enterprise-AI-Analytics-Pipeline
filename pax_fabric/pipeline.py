@@ -708,6 +708,25 @@ def run(params: Optional[dict] = None) -> dict:
             ctx.metrics.query_ms = _run_query_phase(ctx)
         result["records_fetched"] = ctx.metrics.total_records_fetched
 
+        # Default safety behavior: if query orchestration reports unrecovered
+        # partition loss, stop here so partial data is not processed/exported.
+        # Raising here preserves checkpoint for resume via the existing error
+        # path and skips CSV/Delta stages below.
+        unrecovered = int(getattr(ctx.metrics, "partitions_with_data_loss", 0))
+        if unrecovered > 0:
+            cp_path = get_checkpoint_path()
+            write_log("")
+            write_log("  PROGRESS SAVED (run failed — checkpoint preserved)")
+            if cp_path:
+                write_log(f"  Checkpoint:    {cp_path}")
+                write_log(
+                    "  Not all partitions completed; resume with the path above."
+                )
+            raise RuntimeError(
+                f"Unrecovered partition loss detected: {unrecovered} partition(s) "
+                "failed after retry sweep; checkpoint preserved and export/delta stages skipped."
+            )
+
         # --------------------------------------------------------------
         # 5. Post-query: dedupe + trim + explosion + CSV export (STREAMING).
         # --------------------------------------------------------------
@@ -1087,10 +1106,32 @@ def run(params: Optional[dict] = None) -> dict:
         except Exception:
             pass
         if ctx.script_completed:
-            try:
-                remove_checkpoint()
-            except Exception:
-                pass
+            cp_data_final = get_checkpoint_data() or {}
+            cp_parts = (
+                cp_data_final.get("partitions", {})
+                if isinstance(cp_data_final, dict)
+                else {}
+            )
+            cp_stats = (
+                cp_data_final.get("statistics", {})
+                if isinstance(cp_data_final, dict)
+                else {}
+            )
+            total_partitions = int(cp_parts.get("total") or 0)
+            completed_partitions = int(cp_stats.get("partitionsComplete") or 0)
+            should_remove_checkpoint = (
+                total_partitions > 0 and completed_partitions >= total_partitions
+            )
+            if should_remove_checkpoint:
+                try:
+                    remove_checkpoint()
+                except Exception:
+                    pass
+            else:
+                write_log(
+                    "Checkpoint preserved: not all partitions completed; resume is available.",
+                    level="WARN",
+                )
         # Phase B: clean up scratch CSV dir (only after a successful drain).
         if (
             output_mode == "delta"
