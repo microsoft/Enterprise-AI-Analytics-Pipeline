@@ -155,116 +155,24 @@ def connect_agent365_interactive_context(
     phase1_context: Optional[Dict[str, Any]] = None,
     defer_auth_context_display: bool = False,
 ) -> bool:
-    """Establish or restore a delegated Graph context for Agent 365.
+    """No-op context check for the app-only AppRegistration path.
 
-    PS signature:
-        Connect-Agent365InteractiveContext (no params, uses script-scope)
+    PS parity (v1.11.15 L7771-7785): Microsoft Graph exposes
+    ``CopilotPackages.Read.All`` and ``Application.Read.All`` as APPLICATION
+    app-roles, so the existing app-only token from Phase 1 already covers
+    Agent 365. No delegated interactive sign-in is required, which is why
+    Agent 365 + AppRegistration works on noninteractive hosts (containers,
+    Fabric notebooks, CI runners, scheduled tasks). A missing app-role or
+    unenrolled tenant is surfaced later by test_agent365_frontier_access as
+    a 403.
 
-    In PS this is only relevant when $Auth == 'AppRegistration'. For all other
-    auth modes, it returns $true immediately (already have right scopes).
-
-    Args:
-        state: Agent365State instance.
-        auth_mode: The authentication mode ('AppRegistration', 'Interactive', etc.).
-        connect_fn: Callable(scopes: List[str]) -> bool. Establishes delegated context.
-        get_context_fn: Callable() -> Dict with TenantId, Account, Scopes.
-        get_masked_username_fn: Callable(username: str) -> str.
-        phase1_context: Dict with Phase 1 context info (TenantId, GrantedRequired).
-        defer_auth_context_display: Whether to show dual-context display.
-
-    Returns:
-        True if context is ready, False on failure.
+    Kept as a stub so callers (including future delegated-auth variants) can
+    branch on this without special-casing at every call site.
     """
-    if auth_mode != 'AppRegistration':
-        return True
-
-    agent365_scopes = ['CopilotPackages.Read.All', 'Application.Read.All']
-
-    if state.pre_auth_completed:
-        logger.info(
-            "  Restoring Agent 365 interactive context "
-            "(using cached credentials from earlier sign-in)..."
-        )
-    else:
-        logger.info("")
-        logger.info("=== Phase 2: Agent 365 - Interactive sign-in ===")
-        logger.info("  Reason: Agent 365 endpoint has no app-only Graph scope.")
-        logger.info("  Requesting DELEGATED scopes:")
-        logger.info(f"    [Delegated] {', '.join(agent365_scopes)}")
-        logger.info("  Required Entra role on signed-in user:")
-        logger.info("    [Role]      AI Administrator  -OR-  Global Administrator")
-        logger.info("  (Without the role, Graph returns 403 even after consent.)")
-        logger.info("")
-
-    try:
-        if connect_fn is None:
-            raise RuntimeError("No connect_fn provided for interactive context")
-        success = connect_fn(agent365_scopes)
-        if not success:
-            raise RuntimeError("connect_fn returned False")
-
-        state.interactive_ctx = True
-
-        if state.pre_auth_completed:
-            logger.info("  Interactive context restored (no prompt needed).")
-        else:
-            logger.info("  Interactive context established.")
-            # Dual-context display (mirrors PS deferred display logic)
-            if defer_auth_context_display and phase1_context and get_context_fn:
-                try:
-                    deleg_ctx = get_context_fn()
-                    logger.info("")
-                    logger.info("  Effective auth context (dual-mode):")
-                    logger.info(
-                        "    Phase 1 (Audit / EntraUsers / M365) - "
-                        "APP-ONLY (AppRegistration):"
-                    )
-                    logger.info(
-                        f"      Tenant ID: {phase1_context.get('TenantId', '')}"
-                    )
-                    logger.info(
-                        "      Account:   "
-                        "(app-only / AppRegistration - no interactive user)"
-                    )
-                    logger.info(
-                        f"      Scopes:    "
-                        f"{', '.join(phase1_context.get('GrantedRequired', []))}"
-                    )
-                    logger.info(
-                        "    Phase 2 (Agent 365 catalog) - "
-                        "DELEGATED (interactive sign-in):"
-                    )
-                    if deleg_ctx:
-                        logger.info(
-                            f"      Tenant ID: {deleg_ctx.get('TenantId', '')}"
-                        )
-                        deleg_acct = deleg_ctx.get('Account', '')
-                        if get_masked_username_fn and deleg_acct:
-                            deleg_acct = get_masked_username_fn(deleg_acct)
-                        if not deleg_acct or not deleg_acct.strip():
-                            deleg_acct = '(unknown)'
-                        logger.info(f"      Account:   {deleg_acct}")
-                        deleg_granted = [
-                            s for s in agent365_scopes
-                            if s in deleg_ctx.get('Scopes', [])
-                        ]
-                        logger.info(
-                            f"      Scopes:    {', '.join(deleg_granted)}"
-                        )
-                    else:
-                        logger.info(
-                            "      (delegated context not retrievable)"
-                        )
-                    logger.info("")
-                except Exception:
-                    pass
-
-        return True
-    except Exception as e:
-        logger.error(
-            f"  ERROR: Interactive sign-in for Agent 365 failed: {e}"
-        )
-        return False
+    _ = (auth_mode, connect_fn, get_context_fn, get_masked_username_fn,
+         phase1_context, defer_auth_context_display)  # unused under app-only
+    state.interactive_ctx = True
+    return True
 
 
 # =============================================================================
@@ -1364,7 +1272,10 @@ def invoke_agent365_phase(
     logger.info(" Microsoft Agent 365 enrichment phase")
     logger.info("============================================================")
 
-    # AppRegistration path: ensure interactive context (no-op under app-role now).
+    # AppRegistration app-only path: no interactive sign-in required — the
+    # existing app-only token already carries CopilotPackages.Read.All and
+    # Application.Read.All as APPLICATION app-roles. See PS parity source
+    # v1.11.15 L7771-7785.
     if auth_mode == 'AppRegistration':
         if state.pre_auth_completed and state.frontier_available is False:
             logger.warning(
@@ -1373,18 +1284,9 @@ def invoke_agent365_phase(
             )
             return empty
 
-        if not connect_agent365_interactive_context(
+        connect_agent365_interactive_context(
             state, auth_mode=auth_mode, connect_fn=connect_fn
-        ):
-            logger.error(
-                "  Agent 365 phase aborted (interactive sign-in failed)."
-            )
-            state.had_gaps = True
-            gapped = dict(empty)
-            gapped['Reconciled'] = False
-            gapped['ListComplete'] = False
-            gapped['ListReason'] = 'InteractiveSignInFailed'
-            return gapped
+        )
 
     # Frontier probe
     if not test_agent365_frontier_access(state, graph_request_fn=graph_request_fn):
