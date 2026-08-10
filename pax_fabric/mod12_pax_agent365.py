@@ -28,6 +28,7 @@ Hard dependencies: pax_auth (delegated auth context), pax_graph_api (HTTP client
 import csv
 import logging
 import os
+import time
 from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
@@ -56,6 +57,30 @@ class Agent365State:
     audit_enrichment: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     interactive_ctx: bool = False
     pre_auth_completed: bool = False
+    had_gaps: bool = False                       # PS: $script:Agent365HadGaps
+    recovery_leafs: List[str] = field(default_factory=list)  # PS: $script:Agent365RecoveryLeafs
+
+
+# =============================================================================
+# Result dataclasses (PS parity: Get-Agent365Packages / Get-Agent365PackageDetail)
+# =============================================================================
+
+@dataclass
+class Agent365ListResult:
+    """PS parity: PSCustomObject{ Packages, Complete, Reason, PageCount } from Get-Agent365Packages."""
+    packages: List[Dict[str, Any]] = field(default_factory=list)
+    complete: bool = True
+    reason: str = ''
+    page_count: int = 0
+
+
+@dataclass
+class Agent365DetailResult:
+    """PS parity: PSCustomObject{ Outcome, Detail, Reason } from Get-Agent365PackageDetail."""
+    outcome: str = 'DetailFailed'   # 'Success' | 'FailedDependency' | 'DetailFailed'
+    detail: Optional[Dict[str, Any]] = None
+    reason: str = ''
+
 
 
 # =============================================================================
@@ -337,6 +362,103 @@ def _extract_status_code(exc: Exception) -> Optional[int]:
 
 
 # =============================================================================
+# Function 4b: invoke_agent365_graph_with_retry
+#              (PS: Invoke-Agent365GraphWithRetry)
+# =============================================================================
+
+def invoke_agent365_graph_with_retry(
+    uri: str,
+    graph_request_fn: Callable,
+    *,
+    max_attempts: int = 5,
+    sleep_fn: Optional[Callable[[float], None]] = None,
+) -> Dict[str, Any]:
+    """Throttle-aware wrapper for Agent 365 Graph GET calls.
+
+    PS parity: Invoke-Agent365GraphWithRetry — 5 attempts, honors Retry-After
+    on 429/5xx, otherwise exponential backoff capped at 60s. Non-throttle-class
+    errors (4xx except 429) re-raise immediately.
+
+    Args:
+        uri: Absolute Graph URI to GET.
+        graph_request_fn: Callable(method, uri) -> response dict.
+        max_attempts: Max attempts (default 5, matches PS).
+        sleep_fn: Sleep function (default time.sleep). Used for tests.
+
+    Returns:
+        Response dict on success.
+
+    Raises:
+        Whatever the underlying graph_request_fn raises on non-retryable
+        errors or once retries are exhausted.
+    """
+    if sleep_fn is None:
+        sleep_fn = time.sleep
+
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return graph_request_fn('GET', uri) or {}
+        except Exception as e:  # noqa: BLE001
+            last_exc = e
+            status = _extract_status_code(e)
+            is_throttle = (status == 429) or (status is not None and 500 <= status <= 599)
+            if not is_throttle:
+                # Non-retryable — surface immediately.
+                raise
+            if attempt >= max_attempts:
+                logger.warning(
+                    "  Agent 365 Graph retry exhausted after %d attempts "
+                    "(status=%s): %s",
+                    attempt, status, e,
+                )
+                raise
+
+            # Compute wait: Retry-After header wins, else min(60, 2^attempt).
+            wait_seconds: float = 0.0
+            try:
+                resp = getattr(e, 'response', None)
+                if resp is not None:
+                    hdrs = getattr(resp, 'headers', {}) or {}
+                    ra = hdrs.get('Retry-After') or hdrs.get('retry-after')
+                    if ra:
+                        try:
+                            wait_seconds = float(ra)
+                        except (TypeError, ValueError):
+                            wait_seconds = 0.0
+            except Exception:
+                wait_seconds = 0.0
+            if wait_seconds <= 0.0:
+                wait_seconds = float(min(60, 2 ** attempt))
+
+            logger.info(
+                "  Agent 365 Graph throttle/5xx (status=%s) — sleeping %.1fs "
+                "before attempt %d/%d",
+                status, wait_seconds, attempt + 1, max_attempts,
+            )
+            sleep_fn(wait_seconds)
+
+    # Should be unreachable — the loop either returns or raises.
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("invoke_agent365_graph_with_retry exited without a result")
+
+
+# =============================================================================
+# Function 4c: invoke_agent365_early_interactive_sign_in
+#              (PS: Invoke-Agent365EarlyInteractiveSignIn — now a no-op)
+# =============================================================================
+
+def invoke_agent365_early_interactive_sign_in() -> bool:
+    """PS parity: no-op after Agent 365 moved to app-role auth.
+
+    Kept for callable-shape parity so orchestrators can invoke it
+    unconditionally.
+    """
+    return True
+
+
+# =============================================================================
 # Function 5: get_agent365_packages (PS: Get-Agent365Packages)
 # =============================================================================
 
@@ -344,30 +466,44 @@ def get_agent365_packages(
     state: Agent365State,
     graph_request_fn: Optional[Callable] = None,
     refresh_token_fn: Optional[Callable] = None,
-) -> List[Dict[str, Any]]:
-    """Return all Agent 365 catalog packages (list view) with paging.
+) -> Agent365ListResult:
+    """Return all Agent 365 catalog packages with paging + completeness verdict.
 
-    PS signature:
-        Get-Agent365Packages (no params)
-
-    Pages through @odata.nextLink. Safety abort at >500 pages.
+    PS parity: Get-Agent365Packages — returns { Packages, Complete, Reason,
+    PageCount }. Any page failure marks Complete=False and stops paging.
+    Cycle-detects @odata.nextLink to prevent infinite loops.
 
     Args:
-        state: Agent365State instance.
-        graph_request_fn: Callable(method, uri) -> response dict with 'value' and optionally '@odata.nextLink'.
+        state: Agent365State instance (used only for logging context).
+        graph_request_fn: Callable(method, uri) -> response dict with 'value'
+            and optionally '@odata.nextLink'.
         refresh_token_fn: Optional Callable() to refresh token before each page.
 
     Returns:
-        List of package dicts (list-view objects).
+        Agent365ListResult.
     """
-    results: List[Dict[str, Any]] = []
+    result = Agent365ListResult()
+    if graph_request_fn is None:
+        result.complete = False
+        result.reason = 'NoGraphRequestFn'
+        logger.warning("  Agent 365 list skipped: no graph_request_fn provided")
+        return result
+
     uri: Optional[str] = get_agent365_packages_uri()
-    page_num = 0
+    seen_links: set = set()
 
     while uri:
-        page_num += 1
+        # Cycle-detect the next-link.
+        if uri in seen_links:
+            result.complete = False
+            result.reason = f'CycleDetected@page{result.page_count}'
+            logger.warning(
+                "  WARNING: Agent 365 @odata.nextLink cycle detected — aborting"
+            )
+            break
+        seen_links.add(uri)
+        result.page_count += 1
 
-        # Token refresh (best-effort)
         if refresh_token_fn:
             try:
                 refresh_token_fn()
@@ -375,28 +511,33 @@ def get_agent365_packages(
                 pass
 
         try:
-            if graph_request_fn is None:
-                raise RuntimeError("No graph_request_fn provided")
-            resp = graph_request_fn('GET', uri)
-        except Exception as e:
+            resp = invoke_agent365_graph_with_retry(uri, graph_request_fn)
+        except Exception as e:  # noqa: BLE001
+            result.complete = False
+            result.reason = f'PageFailed@{result.page_count}:{e}'
             logger.warning(
-                f"  WARNING: Agent 365 list page {page_num} failed: {e}"
+                "  WARNING: Agent 365 list page %d failed: %s",
+                result.page_count, e,
             )
             break
 
         if resp and resp.get('value'):
             for p in resp['value']:
-                results.append(p)
+                result.packages.append(p)
 
         uri = resp.get('@odata.nextLink') if resp else None
 
-        if page_num > 500:
+        if result.page_count > 500:
+            result.complete = False
+            result.reason = 'PagingSafetyAbort>500'
             logger.warning(
                 "  WARNING: Agent 365 paging safety abort (>500 pages)"
             )
             break
 
-    return results
+    if not result.reason:
+        result.reason = 'OK'
+    return result
 
 
 # =============================================================================
@@ -407,11 +548,12 @@ def get_agent365_package_detail(
     package_id: str,
     graph_request_fn: Optional[Callable] = None,
     refresh_token_fn: Optional[Callable] = None,
-) -> Optional[Dict[str, Any]]:
-    """Return the full detail object for a single agent package.
+) -> Agent365DetailResult:
+    """Return the full detail object for a single agent package with outcome.
 
-    PS signature:
-        Get-Agent365PackageDetail -PackageId <string>
+    PS parity: Get-Agent365PackageDetail — returns { Outcome, Detail, Reason }
+    where Outcome ∈ { 'Success', 'FailedDependency', 'DetailFailed' }. Retries
+    on 429/5xx via invoke_agent365_graph_with_retry.
 
     Args:
         package_id: The package ID to fetch.
@@ -419,8 +561,14 @@ def get_agent365_package_detail(
         refresh_token_fn: Optional Callable() to refresh token.
 
     Returns:
-        Package detail dict, or None on failure.
+        Agent365DetailResult.
     """
+    out = Agent365DetailResult()
+    if graph_request_fn is None:
+        out.outcome = 'DetailFailed'
+        out.reason = 'NoGraphRequestFn'
+        return out
+
     uri = get_agent365_packages_uri(package_id)
 
     if refresh_token_fn:
@@ -430,14 +578,27 @@ def get_agent365_package_detail(
             pass
 
     try:
-        if graph_request_fn is None:
-            raise RuntimeError("No graph_request_fn provided")
-        return graph_request_fn('GET', uri)
-    except Exception as e:
+        resp = invoke_agent365_graph_with_retry(uri, graph_request_fn)
+    except Exception as e:  # noqa: BLE001
+        msg = str(e)
+        # PS parity: classify FailedDependency (424) so audit can report it
+        # separately from generic detail failures.
+        if 'FailedDependency' in msg or _extract_status_code(e) == 424:
+            out.outcome = 'FailedDependency'
+        else:
+            out.outcome = 'DetailFailed'
+        out.reason = msg
         logger.warning(
-            f"  WARNING: Agent 365 detail fetch failed for '{package_id}': {e}"
+            "  WARNING: Agent 365 detail fetch failed for '%s' (%s): %s",
+            package_id, out.outcome, e,
         )
-        return None
+        return out
+
+    out.outcome = 'Success'
+    out.detail = resp
+    out.reason = 'OK'
+    return out
+
 
 
 # =============================================================================
@@ -953,21 +1114,27 @@ def export_agent365_csv(
     rows: List[Dict[str, Any]],
     output_path: str,
     run_timestamp: str = '',
+    append_agent365_info: Optional[str] = None,
 ) -> Optional[str]:
     """Write the Agent 365 CSV (UTF-8 BOM) to output_path.
 
-    PS signature:
-        Export-Agent365Csv -Rows <object[]>
+    PS parity: Export-Agent365Csv. If ``append_agent365_info`` points at an
+    existing CSV, its rows are union-merged with the current-run rows so
+    "departed" agents (present in target, absent from current listing) are
+    preserved. Current-run rows always win on conflict.
 
     Args:
         rows: List of row dicts (from convert_to_agent365_row).
         output_path: Directory to write to.
         run_timestamp: Timestamp string for filename (yyyyMMdd_HHmmss).
+        append_agent365_info: Optional path to an existing Agent365 CSV to
+            union-merge with. Silently ignored if the file does not exist or
+            cannot be parsed.
 
     Returns:
         Full path to written file, or None if no rows.
     """
-    if not rows:
+    if not rows and not append_agent365_info:
         logger.warning("  Agent 365: no rows to write.")
         return None
 
@@ -976,22 +1143,169 @@ def export_agent365_csv(
 
     out_file = os.path.join(output_path, f"Agent365_{run_timestamp}.csv")
 
+    # --- PS parity: union-merge with -AppendAgent365Info target ---
+    final_rows: List[Dict[str, Any]] = list(rows)
+    if append_agent365_info:
+        try:
+            append_path = append_agent365_info
+            if os.path.isfile(append_path):
+                # Collect merge keys from current run. PS keys on 'AgentId';
+                # for parity we key on 'Title ID' (the schema-visible agent
+                # identifier) and fall back to 'AgentId' if the target CSV
+                # exposes it explicitly.
+                current_ids: set = set()
+                for r in rows:
+                    key = str(
+                        r.get('Title ID') or r.get('AgentId') or ''
+                    ).strip()
+                    if key:
+                        current_ids.add(key)
+
+                added = 0
+                with open(
+                    append_path, 'r', newline='', encoding='utf-8-sig'
+                ) as tf:
+                    reader = csv.DictReader(tf)
+                    for tr in reader:
+                        key = str(
+                            tr.get('Title ID') or tr.get('AgentId') or ''
+                        ).strip()
+                        if not key:
+                            continue
+                        if key in current_ids:
+                            continue
+                        # Target-only row — carry forward as "departed" agent.
+                        carry = {
+                            col: tr.get(col, '') for col in AGENT365_COLUMNS
+                        }
+                        final_rows.append(carry)
+                        current_ids.add(key)
+                        added += 1
+                if added:
+                    logger.info(
+                        "  Agent 365 union-merge: carried forward %d "
+                        "departed agent row(s) from %s",
+                        added, append_path,
+                    )
+            else:
+                logger.info(
+                    "  Agent 365 union-merge: append target does not exist "
+                    "(%s) — writing current-run rows only.",
+                    append_path,
+                )
+        except Exception as merge_err:  # noqa: BLE001
+            logger.warning(
+                "  Agent 365 union-merge failed (%s) — writing current-run "
+                "rows only.", merge_err,
+            )
+
+    if not final_rows:
+        logger.warning("  Agent 365: no rows to write after merge.")
+        return None
+
     try:
         with open(out_file, 'w', newline='', encoding='utf-8-sig') as f:
             writer = csv.DictWriter(f, fieldnames=AGENT365_COLUMNS)
             writer.writeheader()
-            for row in rows:
-                # Ensure all columns are present (fill missing with '')
+            for row in final_rows:
                 safe_row = {col: row.get(col, '') for col in AGENT365_COLUMNS}
                 writer.writerow(safe_row)
 
         logger.info(
-            f"  Agent 365 CSV written: {out_file} ({len(rows)} rows)"
+            f"  Agent 365 CSV written: {out_file} ({len(final_rows)} rows)"
         )
         return out_file
     except Exception as e:
         logger.error(f"  ERROR: Failed to write Agent 365 CSV: {e}")
         return None
+
+
+# =============================================================================
+# Function 10b: save_agent365_recovery_csv (PS: Save-Agent365RecoveryCsv)
+# =============================================================================
+
+def save_agent365_recovery_csv(
+    rows: List[Dict[str, Any]],
+    state: Agent365State,
+    output_path: str,
+    run_timestamp: str = '',
+) -> Optional[str]:
+    """Write a partial-listing recovery CSV so operators can inspect what
+    was gathered before the run flagged incomplete.
+
+    PS parity: Save-Agent365RecoveryCsv. Leaf is registered in
+    ``state.recovery_leafs`` so downstream summary code can surface it.
+    """
+    if not rows:
+        logger.info("  Agent 365 recovery: no rows to save.")
+        return None
+
+    if not run_timestamp:
+        run_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+    leaf = f"Agent365_IncompleteListing_{run_timestamp}_recovery.csv"
+    out_file = os.path.join(output_path, leaf)
+
+    try:
+        with open(out_file, 'w', newline='', encoding='utf-8-sig') as f:
+            writer = csv.DictWriter(f, fieldnames=AGENT365_COLUMNS)
+            writer.writeheader()
+            for row in rows:
+                safe_row = {col: row.get(col, '') for col in AGENT365_COLUMNS}
+                writer.writerow(safe_row)
+        state.recovery_leafs.append(leaf)
+        logger.warning(
+            "  Agent 365 recovery CSV written: %s (%d partial row(s))",
+            out_file, len(rows),
+        )
+        return out_file
+    except Exception as e:  # noqa: BLE001
+        logger.error("  ERROR: Failed to write Agent 365 recovery CSV: %s", e)
+        return None
+
+
+# =============================================================================
+# Function 11: add_agent365_workbook_tab (PS: Add-Agent365WorkbookTab)
+# =============================================================================
+
+def add_agent365_workbook_tab(
+    workbook_path: Optional[str],
+    rows: List[Dict[str, Any]],
+) -> None:
+    """Best-effort Agent 365 tab in the Excel workbook (PS parity).
+
+    Python-side Excel export is deprecated (see mod10_pax_csv_export docstring)
+    but this function is kept for callable-shape parity so orchestrators can
+    invoke it unconditionally. Uses openpyxl if available; otherwise logs a
+    warning and no-ops.
+    """
+    if not workbook_path or not rows:
+        return
+    try:
+        from openpyxl import load_workbook  # type: ignore
+    except ImportError:
+        logger.info(
+            "  Agent 365 workbook tab skipped (openpyxl not installed)."
+        )
+        return
+
+    try:
+        wb = load_workbook(workbook_path)
+        if 'Agent365' in wb.sheetnames:
+            del wb['Agent365']
+        ws = wb.create_sheet('Agent365')
+        ws.append(list(AGENT365_COLUMNS))
+        for row in rows:
+            ws.append([row.get(col, '') for col in AGENT365_COLUMNS])
+        wb.save(workbook_path)
+        logger.info(
+            "  Agent 365 workbook tab written to %s (%d rows)",
+            workbook_path, len(rows),
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "  Agent 365 workbook tab failed for %s: %s", workbook_path, e,
+        )
 
 
 # =============================================================================
@@ -1016,34 +1330,48 @@ def invoke_agent365_phase(
     get_audit_records_fn: Optional[Callable] = None,
     sleep_fn: Optional[Callable] = None,
     now_fn: Optional[Callable] = None,
+    append_agent365_info: Optional[str] = None,
+    workbook_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Top-level orchestrator for the Agent 365 phase.
 
-    PS signature:
-        Invoke-Agent365Phase (no params, uses script-scope)
-
-    Called once from main flow when include_agent365_info or only_agent365_info is set.
-
-    Returns:
-        Dict with keys: 'CsvPath' (str|None), 'Rows' (list).
+    PS parity: Invoke-Agent365Phase. Emits a full reconciliation accounting
+    dict and flips ``state.had_gaps`` when listing is incomplete or when
+    some listed packages could not be emitted as rows. The canonical CSV is
+    written only when listing is complete; otherwise a recovery CSV is
+    written and the canonical path is left absent.
     """
+    empty = {
+        'CsvPath': None,
+        'Rows': [],
+        'Listed': 0,
+        'Emitted': 0,
+        'DetailFailed': 0,
+        'FailedDependency': 0,
+        'RowBuildFailed': 0,
+        'SkippedNoId': 0,
+        'Reconciled': True,
+        'ListComplete': True,
+        'RecoveryPath': None,
+        'ListReason': '',
+    }
+
     if not (include_agent365_info or only_agent365_info):
-        return {'CsvPath': None, 'Rows': []}
+        return empty
 
     logger.info("")
     logger.info("============================================================")
     logger.info(" Microsoft Agent 365 enrichment phase")
     logger.info("============================================================")
 
-    # AppRegistration path: ensure interactive context
+    # AppRegistration path: ensure interactive context (no-op under app-role now).
     if auth_mode == 'AppRegistration':
-        # If eager sign-in already determined Frontier unavailable, skip
         if state.pre_auth_completed and state.frontier_available is False:
             logger.warning(
                 "  Agent 365 phase skipped "
                 "(tenant not enrolled / role missing - detected at startup)."
             )
-            return {'CsvPath': None, 'Rows': []}
+            return empty
 
         if not connect_agent365_interactive_context(
             state, auth_mode=auth_mode, connect_fn=connect_fn
@@ -1051,11 +1379,18 @@ def invoke_agent365_phase(
             logger.error(
                 "  Agent 365 phase aborted (interactive sign-in failed)."
             )
-            return {'CsvPath': None, 'Rows': []}
+            state.had_gaps = True
+            gapped = dict(empty)
+            gapped['Reconciled'] = False
+            gapped['ListComplete'] = False
+            gapped['ListReason'] = 'InteractiveSignInFailed'
+            return gapped
 
     # Frontier probe
     if not test_agent365_frontier_access(state, graph_request_fn=graph_request_fn):
-        return {'CsvPath': None, 'Rows': []}
+        # test_agent365_frontier_access already logged the reason. A tenant
+        # that is not enrolled is NOT a gap — the phase simply has no work.
+        return empty
 
     # Audit enrichment (skipped when only_agent365_info)
     audit_enrichment = get_agent365_audit_enrichment(
@@ -1073,55 +1408,123 @@ def invoke_agent365_phase(
     )
     state.audit_enrichment = audit_enrichment
 
-    # List packages
+    # List packages (verdict + accounting).
     logger.info("  Listing Agent 365 packages...")
-    listed = get_agent365_packages(
+    list_result = get_agent365_packages(
         state,
         graph_request_fn=graph_request_fn,
         refresh_token_fn=refresh_token_fn,
     )
+    listed_count = len(list_result.packages)
 
-    if not listed:
+    if listed_count == 0 and list_result.complete:
         logger.warning("  No Agent 365 packages returned by the catalog.")
-        return {'CsvPath': None, 'Rows': []}
+        return empty
 
-    logger.info(f"  {len(listed)} package(s) listed; fetching details...")
+    logger.info(
+        "  %d package(s) listed (Complete=%s, Reason=%s, Pages=%d); "
+        "fetching details...",
+        listed_count, list_result.complete, list_result.reason,
+        list_result.page_count,
+    )
 
-    # Fetch details and build rows
+    # Fetch details and build rows with per-package outcome classification.
     rows: List[Dict[str, Any]] = []
-    for idx, p in enumerate(listed, 1):
+    detail_failed = 0
+    failed_dependency = 0
+    row_build_failed = 0
+    skipped_no_id = 0
+
+    for idx, p in enumerate(list_result.packages, 1):
         pid = p.get('id') or p.get('titleId')
         if not pid:
+            skipped_no_id += 1
             continue
 
-        detail = get_agent365_package_detail(
+        detail_result = get_agent365_package_detail(
             pid,
             graph_request_fn=graph_request_fn,
             refresh_token_fn=refresh_token_fn,
         )
-        if not detail:
+
+        if detail_result.outcome == 'FailedDependency':
+            failed_dependency += 1
+            continue
+        if detail_result.outcome != 'Success' or detail_result.detail is None:
+            detail_failed += 1
             continue
 
         try:
             row = convert_to_agent365_row(
-                detail,
+                detail_result.detail,
                 state,
                 audit_enrichment=audit_enrichment,
                 graph_request_fn=graph_request_fn,
             )
             rows.append(row)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
+            row_build_failed += 1
             logger.warning(
-                f"  WARNING: Row build failed for package '{pid}': {e}"
+                "  WARNING: Row build failed for package '%s': %s", pid, e,
             )
 
         if idx % 25 == 0:
             logger.info(
-                f"    ... {idx}/{len(listed)} packages processed"
+                "    ... %d/%d packages processed", idx, listed_count,
             )
 
-    # Export CSV
-    csv_path = export_agent365_csv(rows, output_path, run_timestamp)
+    emitted = len(rows)
+    accounted = emitted + detail_failed + failed_dependency + row_build_failed + skipped_no_id
+    reconciled = (accounted == listed_count)
 
-    return {'CsvPath': csv_path, 'Rows': rows}
+    logger.info(
+        "  Agent 365 reconciliation: Listed=%d Emitted=%d DetailFailed=%d "
+        "FailedDependency=%d RowBuildFailed=%d SkippedNoId=%d "
+        "Reconciled=%s ListComplete=%s",
+        listed_count, emitted, detail_failed, failed_dependency,
+        row_build_failed, skipped_no_id, reconciled, list_result.complete,
+    )
+
+    result_dict = {
+        'CsvPath': None,
+        'Rows': rows,
+        'Listed': listed_count,
+        'Emitted': emitted,
+        'DetailFailed': detail_failed,
+        'FailedDependency': failed_dependency,
+        'RowBuildFailed': row_build_failed,
+        'SkippedNoId': skipped_no_id,
+        'Reconciled': reconciled,
+        'ListComplete': list_result.complete,
+        'RecoveryPath': None,
+        'ListReason': list_result.reason,
+    }
+
+    # Incomplete listing => DO NOT overwrite canonical CSV; write recovery
+    # instead and mark the run as gapped.
+    if not list_result.complete:
+        state.had_gaps = True
+        recovery = save_agent365_recovery_csv(
+            rows, state, output_path, run_timestamp,
+        )
+        result_dict['RecoveryPath'] = recovery
+        return result_dict
+
+    # Complete listing but some packages could not be emitted => partial gap.
+    if detail_failed or failed_dependency or row_build_failed or skipped_no_id:
+        state.had_gaps = True
+
+    csv_path = export_agent365_csv(
+        rows,
+        output_path,
+        run_timestamp,
+        append_agent365_info=append_agent365_info,
+    )
+    result_dict['CsvPath'] = csv_path
+
+    if workbook_path:
+        add_agent365_workbook_tab(workbook_path, rows)
+
+    return result_dict
+
 
