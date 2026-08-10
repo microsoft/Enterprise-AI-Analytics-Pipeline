@@ -84,6 +84,10 @@ def table_name_for(csv_stem: str, overrides: Optional[dict[str, str]] = None) ->
     if m:
         return "Entra_Raw"
 
+    # Agent 365 catalog snapshot (mod12 emits Agent365_<ts>.csv).
+    if re.match(rf"^Agent365_{_TS_RE}$", csv_stem):
+        return "Agent365"
+
     if re.match(rf"^Purview_Audit_{_TS_RE}$", csv_stem):
         return "Audit_Raw"
 
