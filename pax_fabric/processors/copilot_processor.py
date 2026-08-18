@@ -1405,9 +1405,16 @@ def _normalize_col_name(name: str) -> str:
 
 
 def detect_has_license_column(headers: list[str]) -> str | None:
-    for variant in HAS_LICENSE_VARIANTS:
-        if variant in headers:
-            return variant
+    # Normalized comparison (case/space/underscore/hyphen-insensitive), matching
+    # the approach used by detect_upn_column / detect_department_column. A prior
+    # exact-string-match implementation silently failed to recognize any header
+    # variant not byte-identical to one of HAS_LICENSE_VARIANTS (e.g. different
+    # casing or a trailing space), causing every user to fall back to
+    # "Unlicensed" in License Status.
+    normalized_variants = {_normalize_col_name(v) for v in HAS_LICENSE_VARIANTS}
+    for h in headers:
+        if _normalize_col_name(h) in normalized_variants:
+            return h
     return None
 
 
