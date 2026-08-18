@@ -92,6 +92,7 @@ from .mod7_pax_graph_api import (
 )
 from .mod8_pax_entra import (
     get_entra_users_data,
+    get_user_license_data,
     load_user_info_file,
     load_user_info_supplement,
     merge_entra_supplement,
@@ -3170,8 +3171,37 @@ def _fetch_entra_users_with_overrides(
         write_log(f"UserInfoFile supplied — using {user_info_file} instead of a live Entra pull.")
         return load_user_info_file(user_info_file)
 
+    write_log("Fetching license data from Microsoft Graph API...")
+    license_data = get_user_license_data(
+        http_client=entra_session,
+        token_refresh_fn=token_refresh_fn,
+    )
+    if license_data.get("Error"):
+        write_log(
+            f"License fetch FAILED: {license_data['Error']} — every user will show "
+            f"License_Status=Unlicensed. Verify the app/service principal has "
+            f"Organization.Read.All (for /subscribedSkus) and User.Read.All "
+            f"(for assignedPlans) granted and admin-consented.",
+            level="ERROR",
+        )
+    elif license_data.get("CopilotPlanCount", 0) == 0:
+        write_log(
+            f"License fetch: 0 Copilot service plan(s) found among "
+            f"{license_data.get('SkuCount', 0)} tenant SKU(s) — every user will show "
+            f"License_Status=Unlicensed. Check that Copilot is actually licensed in this "
+            f"tenant and that /subscribedSkus returned service plans (Organization.Read.All).",
+            level="WARN",
+        )
+    else:
+        write_log(
+            f"License fetch: {license_data.get('CopilotUserCount', 0)} of "
+            f"{license_data.get('UserCount', 0)} user(s) detected with Copilot license "
+            f"({license_data.get('CopilotPlanCount', 0)} Copilot plan(s) found)."
+        )
+
     entra_data = get_entra_users_data(
         http_client=entra_session,
+        license_data=license_data,
         token_refresh_fn=token_refresh_fn,
     )
 

@@ -409,6 +409,24 @@ def run(params: Optional[dict] = None) -> dict:
     config = ctx.config
 
     # ------------------------------------------------------------------
+    # 0a-1. Org hierarchy filler default (Fabric-only).
+    # ------------------------------------------------------------------
+    # The rolled-up Users output always emits Level0..Level14 columns; any
+    # level slot deeper than a user's real hierarchy is otherwise left
+    # blank (--hierarchy-fill default 'none'), which renders as blank
+    # drill-down members in Power BI. Default the Fabric entry point to
+    # the existing 'Fixed' filler mode with label "Assistive Directs" so
+    # unused levels get a real label instead of a blank member — without
+    # ever assigning those synthetic levels a UserKey (see _hier_filler in
+    # processors/copilot_processor.py). Only applied when the caller has
+    # not explicitly set FillerLabel via params, so the CLI's own default
+    # ('none') and any explicit Fabric override are both preserved.
+    if config.filler_label is None:
+        config.filler_label = "Fixed"
+        if not config.filler_label_text:
+            config.filler_label_text = "Assistive Directs"
+
+    # ------------------------------------------------------------------
     # 0a. Reset module-level state from any prior run in this session.
     # ------------------------------------------------------------------
     # Fabric notebooks keep Python modules loaded across cell executions,

@@ -155,6 +155,159 @@ _ENTRA_USER_SELECT_FIELDS: list[str] = [
 
 
 # ---------------------------------------------------------------------------
+# 63. Get-UserLicenseData (Line 10319)
+# ---------------------------------------------------------------------------
+
+def get_user_license_data(
+    *,
+    http_client: Any = None,
+    token_refresh_fn: Optional[Callable[[], bool]] = None,
+    quiet: bool = False,
+) -> dict[str, dict[str, Any]]:
+    """
+    Fetches user license information from Microsoft Graph API.
+
+    PS equivalent: Get-UserLicenseData (L10319)
+
+    Dynamic Copilot license detection (no hardcoded SKU GUIDs):
+    1. From /subscribedSkus, collect every servicePlanId whose
+       servicePlanName matches '*COPILOT*' (case-insensitive).
+    2. For each user, scan assignedPlans for entries where capabilityStatus
+       == 'Enabled' AND servicePlanId is in the discovered Copilot plan set.
+    This honors capability state (admin-disabled service plans are correctly
+    excluded) and auto-adapts to any current or future Copilot SKU (M365,
+    EDU, Sales, Finance, GCC, etc.). Requires only User.Read.All +
+    Organization.Read.All (no additional permissions).
+
+    Args:
+        http_client: HTTP client with a .get() method.
+        token_refresh_fn: Optional 401-retry callback (see _graph_get_with_refresh).
+        quiet: If True, suppress info-level log messages.
+
+    Returns:
+        {"UserLicenses": {userId_or_upn: [skuName, ...]},
+         "UserHasCopilot": {userId_or_upn: bool},
+         "SkuCount": int, "CopilotPlanCount": int,
+         "UserCount": int, "CopilotUserCount": int,
+         "Error": str | None}.
+        Both license dicts are keyed by BOTH the user's id and userPrincipalName
+        for flexible lookup (PS parity). Empty dicts under both keys on failure
+        or when no http_client is supplied (fail-open: a license-fetch error
+        never blocks the Entra directory fetch; License Status falls back to
+        Unlicensed for every user, matching PS behavior). The extra diagnostic
+        keys let the caller log an unambiguous summary/warning without
+        re-deriving counts (e.g. CopilotPlanCount == 0 or Error is not None
+        both explain a fleet-wide "Unlicensed" result).
+    """
+    user_licenses: dict[str, list[str]] = {}
+    user_has_copilot: dict[str, bool] = {}
+
+    if http_client is None:
+        logger.warning("WARNING: No HTTP client provided for license data fetch")
+        return {
+            "UserLicenses": user_licenses, "UserHasCopilot": user_has_copilot,
+            "SkuCount": 0, "CopilotPlanCount": 0, "UserCount": 0, "CopilotUserCount": 0,
+            "Error": "No HTTP client provided",
+        }
+
+    try:
+        if not quiet:
+            logger.info("Fetching license data from Microsoft Graph API...")
+
+        # ── Subscribed SKUs: skuId -> skuPartNumber + discover Copilot service plans ──
+        resp = _graph_get_with_refresh(
+            http_client, "https://graph.microsoft.com/v1.0/subscribedSkus", token_refresh_fn
+        )
+        skus = resp.json().get("value") or []
+        if not quiet:
+            logger.info("  Found %d SKU(s) in tenant", len(skus))
+
+        sku_lookup: dict[str, str] = {}
+        copilot_plan_ids: set[str] = set()
+        for sku in skus:
+            sku_id = sku.get("skuId")
+            sku_name = sku.get("skuPartNumber")
+            if sku_id:
+                sku_lookup[sku_id] = sku_name
+            for plan in sku.get("servicePlans") or []:
+                plan_name = plan.get("servicePlanName")
+                plan_id = plan.get("servicePlanId")
+                if plan_name and plan_id and "COPILOT" in str(plan_name).upper():
+                    copilot_plan_ids.add(str(plan_id))
+        if not quiet:
+            logger.info("  Discovered %d Copilot service plan(s) in tenant", len(copilot_plan_ids))
+
+        # ── Users with license assignments (paginated) ──
+        if not quiet:
+            logger.info("  Fetching user license assignments...")
+        select_param = "id,userPrincipalName,assignedLicenses,assignedPlans"
+        user_uri: Optional[str] = (
+            f"https://graph.microsoft.com/v1.0/users?$select={select_param}&$top=999"
+        )
+        user_count = 0
+        copilot_user_count = 0
+
+        while user_uri:
+            resp = _graph_get_with_refresh(http_client, user_uri, token_refresh_fn)
+            resp_data = resp.json()
+
+            for user in resp_data.get("value") or []:
+                user_id = user.get("id")
+                upn = user.get("userPrincipalName")
+                if not user_id or not upn:
+                    continue
+
+                user_count += 1
+                licenses: list[str] = []
+                for lic in user.get("assignedLicenses") or []:
+                    sku_id = lic.get("skuId")
+                    licenses.append(sku_lookup.get(sku_id, sku_id))
+
+                has_copilot = False
+                if copilot_plan_ids:
+                    for plan in user.get("assignedPlans") or []:
+                        plan_id = plan.get("servicePlanId")
+                        if (
+                            plan.get("capabilityStatus") == "Enabled"
+                            and plan_id
+                            and str(plan_id) in copilot_plan_ids
+                        ):
+                            has_copilot = True
+                            break
+
+                if licenses:
+                    user_licenses[user_id] = licenses
+                    user_licenses[upn] = licenses
+
+                user_has_copilot[user_id] = has_copilot
+                user_has_copilot[upn] = has_copilot
+                if has_copilot:
+                    copilot_user_count += 1
+
+            user_uri = resp_data.get("@odata.nextLink")
+
+        if not quiet:
+            logger.info("  Processed %d user(s) with license assignments", user_count)
+            logger.info("  Detected %d user(s) with Copilot licenses", copilot_user_count)
+
+        return {
+            "UserLicenses": user_licenses, "UserHasCopilot": user_has_copilot,
+            "SkuCount": len(skus), "CopilotPlanCount": len(copilot_plan_ids),
+            "UserCount": user_count, "CopilotUserCount": copilot_user_count,
+            "Error": None,
+        }
+
+    except Exception as e:
+        logger.warning("WARNING: Failed to fetch license data: %s", e)
+        logger.warning("         License columns will be empty in export")
+        return {
+            "UserLicenses": {}, "UserHasCopilot": {},
+            "SkuCount": 0, "CopilotPlanCount": 0, "UserCount": 0, "CopilotUserCount": 0,
+            "Error": str(e),
+        }
+
+
+# ---------------------------------------------------------------------------
 # 64. ConvertTo-FlatEntraUsers (Line 10454)
 # ---------------------------------------------------------------------------
 
