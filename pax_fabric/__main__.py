@@ -1135,7 +1135,8 @@ def main() -> int:
     if exit_code == EXIT_SUCCESS:
         if getattr(ctx.metrics, 'entra_directory_fetch_failed', False):
             exit_code = EXIT_DIRECTORY_FETCH
-        elif getattr(ctx.metrics, 'partitions_with_data_loss', 0) > 0:
+        elif getattr(ctx.metrics, 'partitions_with_data_loss', 0) > 0 \
+                or getattr(ctx.metrics, 'agent365_had_gaps', False):
             exit_code = EXIT_COMPLETED_WITH_GAPS
 
     return exit_code

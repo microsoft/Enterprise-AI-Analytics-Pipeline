@@ -924,8 +924,43 @@ def run(params: Optional[dict] = None) -> dict:
         if getattr(config, "include_agent365_info", False) or only_agent365:
             set_progress_phase("Export", status="Agent 365 catalog")
             from .mod12_pax_agent365 import Agent365State, invoke_agent365_phase
-            invoke_agent365_phase(
-                state=Agent365State(),
+            from .mod5_pax_auth import (
+                get_graph_access_token,
+                refresh_graph_token_if_needed,
+            )
+            from .mod7_pax_graph_api import (
+                get_current_headers,
+                get_graph_audit_query_status,
+                get_graph_audit_records,
+                invoke_graph_audit_query,
+            )
+
+            def _agent365_graph_get(method: str, url: str) -> dict:
+                """Local HTTP GET adapter for Agent 365 -> Graph."""
+                import requests  # lazy
+                if method.upper() != 'GET':
+                    raise RuntimeError(
+                        f"Agent 365 adapter only supports GET (got {method})"
+                    )
+                headers = get_current_headers(get_graph_access_token())
+                resp = requests.get(url, headers=headers, timeout=60)
+                if not (200 <= resp.status_code < 300):
+                    err = RuntimeError(
+                        f"HTTP {resp.status_code} from {url}: "
+                        f"{resp.text[:500]}"
+                    )
+                    setattr(err, 'status_code', resp.status_code)
+                    setattr(err, 'response', resp)
+                    raise err
+                try:
+                    return resp.json() if resp.content else {}
+                except ValueError:
+                    return {}
+
+            agent365_state = Agent365State()
+            ctx.agent365_state = agent365_state
+            agent365_result = invoke_agent365_phase(
+                state=agent365_state,
                 include_agent365_info=getattr(config, "include_agent365_info", False),
                 only_agent365_info=only_agent365,
                 auth_mode=config.auth,
@@ -934,6 +969,19 @@ def run(params: Optional[dict] = None) -> dict:
                 graph_connected=is_connected(),
                 start_date=config.trim_start_date_utc,
                 end_date=config.trim_end_date_utc,
+                graph_request_fn=_agent365_graph_get,
+                refresh_token_fn=refresh_graph_token_if_needed,
+                invoke_audit_query_fn=invoke_graph_audit_query,
+                get_query_status_fn=get_graph_audit_query_status,
+                get_audit_records_fn=get_graph_audit_records,
+                sleep_fn=time.sleep,
+                now_fn=lambda: datetime.now(timezone.utc),
+                append_agent365_info=getattr(config, "append_agent365_info", None),
+            )
+            ctx.metrics.agent365_had_gaps = bool(
+                agent365_state.had_gaps
+                or not agent365_result.get('ListComplete', True)
+                or not agent365_result.get('Reconciled', True)
             )
 
         if only_user_info:
