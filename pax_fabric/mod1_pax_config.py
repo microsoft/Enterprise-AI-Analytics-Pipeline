@@ -1111,15 +1111,12 @@ def validate_config(config: PAXConfig) -> list[str]:
             "Supply them via CLI (-ClientId / -ClientSecret) or environment variables."
         )
 
-    # Agent365 + AppRegistration on noninteractive host: rejected
-    if (config.include_agent365_info or config.only_agent365_info):
-        if test_is_non_interactive():
-            errors.append(
-                "Agent 365 + Auth=AppRegistration is not supported on a noninteractive host. "
-                "Detected a noninteractive host (container, CI runner, scheduled task, or "
-                "pipeline with redirected stdin). Agent 365 enrichment under AppRegistration "
-                "requires an interactive delegated sign-in."
-            )
+    # Agent 365 + app-only AppRegistration is fully supported on noninteractive
+    # hosts. Microsoft Graph exposes CopilotPackages.Read.All (+ Application.Read.All)
+    # as APPLICATION app-roles; the existing app-only token already carries them, so
+    # no interactive delegated sign-in is required. Missing app-role / unenrolled
+    # tenant is surfaced at runtime as a 403 by test_agent365_frontier_access.
+    # See PS parity source v1.11.15 L7771-7785.
 
     # Date validation
     if config.start_date and config.start_date != "*":

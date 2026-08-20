@@ -365,6 +365,9 @@ def _get_write_strategy(table_name: str) -> str:
     # Snapshot / aggregation tables → overwrite
     if table_name.startswith("Entra_"):
         return "overwrite"
+    # Agent 365 catalog is a point-in-time tenant snapshot (no date column).
+    if table_name == "Agent365":
+        return "overwrite"
     if "UserStats" in table_name:
         return "overwrite"
     if "SessionCohort" in table_name:
@@ -800,6 +803,95 @@ def _auto_drop_delta_columns(
         storage_options=storage_options,
     )
     return row_count
+
+
+def purge_legacy_columns(
+    target_uri: str,
+    legacy_cols: list[str],
+    *,
+    storage_options: dict | None = None,
+    log_fn=None,
+) -> list[str]:
+    """Drop known-legacy column(s) from an existing Delta table, if present.
+
+    Proactive cleanup helper for columns left behind by prior schema
+    evolution -- e.g. a case-only ``displayName``/``country`` variant that
+    predates the AIO ``DisplayName``/``Country`` canonical rename in
+    ``processors/copilot_processor.py``. Delta Lake forbids two columns in
+    the same table that differ only by case, so once the pipeline starts
+    emitting the canonical capitalized name, a write that still finds the
+    old lowercase column on disk fails outright with a
+    ``Duplicate field name (case-insensitive)`` schema error rather than
+    just leaving stale data -- callers MUST invoke this BEFORE the write
+    that introduces the canonical column, not after.
+
+    ``legacy_cols`` is matched by EXACT case only (never case-insensitive):
+    this function is specifically for dropping a legacy name that collides
+    case-insensitively with a *different*, still-wanted canonical column,
+    so a case-insensitive match here would risk dropping the canonical
+    column itself once the table has already migrated to it.
+
+    No-op (returns ``[]``) when:
+      - the table does not exist yet (nothing to clean up), or
+      - none of ``legacy_cols`` are present (by exact name) in the current
+        schema.
+
+    Never raises -- logs a WARN and returns ``[]`` on any failure so a
+    cleanup hiccup never blocks the caller's write pipeline. Uses
+    :func:`_auto_drop_delta_columns` under the hood, so rows are preserved
+    (only the named columns are removed) and the pre-drop table version
+    remains available via Delta time-travel for the lakehouse's retention
+    window.
+
+    Returns the list of column names actually dropped (as they appear in
+    ``dt.schema()``).
+    """
+    def _log(msg: str, level: str = "INFO") -> None:
+        if log_fn:
+            log_fn(msg, level)
+
+    if not legacy_cols:
+        return []
+
+    try:
+        from deltalake import DeltaTable
+    except ImportError:
+        return []
+
+    try:
+        dt = DeltaTable(target_uri, storage_options=storage_options)
+    except Exception:
+        # Table doesn't exist yet (first run) or is otherwise unreachable --
+        # nothing to purge.
+        return []
+
+    existing_cols = [f.name for f in dt.schema().fields]
+    legacy_exact = set(legacy_cols)
+    to_drop = [c for c in existing_cols if c in legacy_exact]
+    if not to_drop:
+        return []
+
+    try:
+        rows_kept = _auto_drop_delta_columns(
+            target_uri, to_drop, storage_options=storage_options,
+        )
+        _log(
+            f"Purged legacy column(s) from '{target_uri}': {', '.join(to_drop)} "
+            f"({rows_kept:,} row(s) preserved).",
+            "WARN",
+        )
+        return to_drop
+    except Exception as exc:  # noqa: BLE001 -- fail-soft cleanup
+        log.warning(
+            "purge_legacy_columns: failed to drop %s from %s: %s",
+            to_drop, target_uri, exc,
+        )
+        _log(
+            f"Legacy column purge SKIPPED for '{target_uri}' "
+            f"(non-fatal): {type(exc).__name__}: {exc}",
+            "WARN",
+        )
+        return []
 
 
 def test_delta_table_schema_compat(

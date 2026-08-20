@@ -127,3 +127,6 @@ class PAXMetrics:
     # since the primary audit output is still usable.
     entra_directory_fetch_failed: bool = False
 
+    # PS parity: $script:Agent365HadGaps -> exit code 40 refinement.
+    agent365_had_gaps: bool = False
+

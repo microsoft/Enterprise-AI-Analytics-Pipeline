@@ -23,8 +23,7 @@ embedded processor at this version number):
                 export), and --with-aggregates pre-aggregated summary tables.
     NOT PORTED (deferred — accepted as a scope trade-off given the size of
                 this port): the 3-file --licensing input mode, SQLite-backed
-                row streaming for very large Entra directories, and AIO
-                canonical-header aliasing.
+                row streaming for very large Entra directories.
 
 Inputs:
     --purview <raw Purview audit log CSV>     (required)
@@ -221,6 +220,25 @@ def schema_for(profile: str) -> tuple[tuple[str, ...], tuple[str, ...], list[str
 UPN_VARIANTS_NORMALIZED = {"userprincipalname", "upn", "personid"}
 DEPARTMENT_VARIANT_NORMALIZED = "department"
 JOBTITLE_RAW_NAME = "jobTitle"  # exact-match rename to "JobTitle"
+
+# Exact-case Users columns the AIO semantic model expects as source columns. `displayName` and
+# `country` are RENAMED (not duplicated) to their canonical case -- carrying both would produce
+# two headers differing only by case, which case-insensitive CSV readers (e.g. PowerShell's
+# Import-Csv) reject. Ported verbatim from the PowerShell embedded processor's
+# _AIO_CANONICAL_RENAMES. AIBV output is unaffected.
+_AIO_CANONICAL_RENAMES: tuple[tuple[str, str], ...] = (
+    ("displayName", "DisplayName"),
+    ("country", "Country"),
+)
+
+# AIO-profile-only additive email alias (ported from the PowerShell embedded processor's
+# _AIO_EMAIL_SOURCE / _AIO_EMAIL_CANONICAL). `Email` is NOT a rename of `mail` -- the two may
+# legitimately differ -- so `mail` is always retained unchanged and `Email` is appended as a
+# separate output column, populated from `mail` only when `Email` itself is blank. AIBV output
+# is unaffected.
+_AIO_EMAIL_SOURCE = "mail"
+_AIO_EMAIL_CANONICAL = "Email"
+
 HAS_LICENSE_VARIANTS = (
     "Has license",
     "Has License",
@@ -1465,10 +1483,15 @@ def load_entra_and_write_users(
 
     NOTE (pax_fabric port scope): ``profile`` is accepted for call-site parity
     with the v4.2.1 dual-profile processor but is NOT yet used to select a
-    3-file licensing input or AIO canonical header aliasing — those remain
-    deferred (see module docstring). Deidentification of Entra identity
-    columns is likewise deferred here; only the fact-row values produced by
-    explode_record are deidentified in this port.
+    3-file licensing input — that remains deferred (see module docstring).
+    The AIO-only header aliasing IS implemented: ``displayName``/``country``
+    are RENAMED to ``DisplayName``/``Country`` (case-only rename, dropping the
+    lowercase duplicate), while ``mail`` -> ``Email`` is an ADDITIVE alias
+    (``mail`` is retained unchanged; ``Email`` is a separate column populated
+    from it). Both mirror the PowerShell embedded processor exactly.
+    Deidentification of Entra identity columns is likewise deferred here;
+    only the fact-row values produced by explode_record are deidentified in
+    this port.
     """
     with open(entra_csv, "r", encoding="utf-8-sig", newline="") as fin:
         # Sniff via a generous quote-aware reader; encoding="utf-8-sig" eats BOM if present.
@@ -1490,7 +1513,7 @@ def load_entra_and_write_users(
         # rename preserves the existing values AND prevents emitting a CSV with
         # duplicate header columns (which then crashes downstream consumers
         # such as PowerShell's Import-Csv -> "member already present").
-        rename_map: dict[str, str] = {}
+        rename_map: dict[str, str | None] = {}
         if upn_col and upn_col != "PersonId" and "PersonId" not in original_headers:
             rename_map[upn_col] = "PersonId"
         if dept_col and dept_col != "Organization" and "Organization" not in original_headers:
@@ -1500,16 +1523,42 @@ def load_entra_and_write_users(
         if has_license_col and has_license_col != "Has license" and "Has license" not in original_headers:
             rename_map[has_license_col] = "Has license"
 
+        # AIO canonical identity headers (aio profile only, RENAME not duplicate). When the
+        # export already supplies the exact canonical header (rare), the case-only variant is
+        # dropped from the output but its source name is remembered so a blank canonical value
+        # still falls back to the variant's value in the write loop below, rather than emitting
+        # a blank field. Lookups are explicit, case-sensitive exact matches.
+        aio_fallback_source_by_canonical: dict[str, str] = {}
+        if profile == "aio":
+            for _src, _canon in _AIO_CANONICAL_RENAMES:
+                _srcs = [h for h in original_headers if h == _src]
+                _canons = [h for h in original_headers if h == _canon]
+                if _canons:
+                    for h in _srcs:
+                        rename_map[h] = None
+                        aio_fallback_source_by_canonical[_canon] = h
+                elif _srcs:
+                    rename_map[_srcs[0]] = _canon
+
         # Final header list for users CSV — preserve original order, apply renames,
         # then append injected columns. UserKey is the INT surrogate that joins
         # to the fact table.
         renamed_headers = [rename_map.get(h, h) for h in original_headers]
+        # A None target means the source column is intentionally dropped (AIO case-only variant
+        # superseded by an already canonical header supplied by the source).
+        renamed_headers = [h for h in renamed_headers if h is not None]
         injected = ["UserKey", "PersonId_Normalized", "License Status", "TotalEmployees"]
         if "Has license" not in renamed_headers:
             renamed_headers.append("Has license")
         for inj in injected:
             if inj not in renamed_headers:
                 renamed_headers.append(inj)
+        # AIO exact-case alias header (aio profile only, additive). `mail` is left in place;
+        # `Email` is a separate column, populated from `mail` in the write loop below.
+        # AIBV header shape is deliberately unchanged.
+        if profile == "aio":
+            if _AIO_EMAIL_CANONICAL not in renamed_headers:
+                renamed_headers.append(_AIO_EMAIL_CANONICAL)
         # Org/manager hierarchy columns (always appended; AIO/AIBV Users dim).
         for hc in _HIER_COLUMNS:
             if hc not in renamed_headers:
@@ -1572,6 +1621,16 @@ def load_entra_and_write_users(
                 if tgt_h in out_row:
                     out_row[tgt_h] = "" if value is None else str(value)
 
+            # AIO canonical selection: prefer a nonblank exact canonical value, otherwise fall
+            # back to the dropped case-only variant's source value. No-op unless the source
+            # already supplied the exact canonical header (rare) -- the common case (only
+            # lowercase displayName/country present) is fully handled by the rename above.
+            if profile == "aio":
+                for _canon, _srcname in aio_fallback_source_by_canonical.items():
+                    if not out_row.get(_canon, ""):
+                        _fb = src_row.get(_srcname, "")
+                        out_row[_canon] = "" if _fb is None else str(_fb)
+
             # PersonId_Normalized
             person_id = out_row.get("PersonId", "")
             person_id_norm = person_id.strip().lower() if person_id else ""
@@ -1609,6 +1668,13 @@ def load_entra_and_write_users(
                 if hrec:
                     for hc in _HIER_COLUMNS:
                         out_row[hc] = hrec.get(hc, "")
+
+            # AIO exact-case alias. `mail` is untouched; `Email` is populated from it only
+            # when `Email` is still blank, so an already-populated `Email` (e.g. from a
+            # directory export that already carries both columns) is never overwritten.
+            if profile == "aio":
+                if not out_row.get(_AIO_EMAIL_CANONICAL, ""):
+                    out_row[_AIO_EMAIL_CANONICAL] = out_row.get(_AIO_EMAIL_SOURCE, "")
 
             writer.writerow(out_row)
 

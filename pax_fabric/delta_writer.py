@@ -53,6 +53,15 @@ from . import files_io
 # Filename → table-name mapping rules. Order matters (most specific first).
 _TS_RE = r"\d{8}_\d{6}"
 
+# Known legacy case-only columns superseded by the AIO canonical
+# DisplayName/Country rename (see processors/copilot_processor.py
+# _AIO_CANONICAL_RENAMES). The Entra_Users Delta table accumulated these
+# under an earlier schema; schema_mode='merge' never drops unused columns
+# on its own, so they'd otherwise linger forever as stale/NULL fields once
+# the current pipeline stops populating them. Purged automatically after
+# each successful Entra_Users write via mod16_pax_delta.purge_legacy_columns.
+_LEGACY_ENTRA_USERS_COLUMNS: tuple[str, ...] = ("displayName", "country")
+
 
 def table_name_for(csv_stem: str, overrides: Optional[dict[str, str]] = None) -> str:
     """Derive a Delta table name from a CSV filename stem.
@@ -83,6 +92,10 @@ def table_name_for(csv_stem: str, overrides: Optional[dict[str, str]] = None) ->
     m = re.match(rf"^EntraUsers_MAClicensing_{_TS_RE}$", csv_stem)
     if m:
         return "Entra_Raw"
+
+    # Agent 365 catalog snapshot (mod12 emits Agent365_<ts>.csv).
+    if re.match(rf"^Agent365_{_TS_RE}$", csv_stem):
+        return "Agent365"
 
     if re.match(rf"^Purview_Audit_{_TS_RE}$", csv_stem):
         return "Audit_Raw"
@@ -218,6 +231,27 @@ def csv_dir_to_delta(
 
         run_id_tag = f" run_id={run_id}" if run_id else ""
         _log(f"Delta append start: {table}{run_id_tag}  source={os.path.basename(csv_path)}")
+
+        # One-time cleanup: purge the legacy lowercase displayName/country
+        # columns from Entra_Users BEFORE writing. This must run before the
+        # write, not after: Delta Lake forbids two columns that differ only
+        # by case, so once the CSV carries the canonical DisplayName/Country
+        # (see processors/copilot_processor.py _AIO_CANONICAL_RENAMES) a
+        # write against a table that still has the old lowercase columns
+        # fails outright with a case-collision schema error rather than
+        # merely leaving stale data. No-op once already purged (or if the
+        # table never had them); failures are logged but never abort the
+        # write -- this is best-effort schema hygiene, not a hard
+        # dependency for the append itself.
+        if table == "Entra_Users":
+            pre_dropped = mod16_pax_delta.purge_legacy_columns(
+                target_path,
+                list(_LEGACY_ENTRA_USERS_COLUMNS),
+                storage_options=storage_options,
+                log_fn=log_fn,
+            )
+            if pre_dropped:
+                _log(f"Delta legacy-column purge OK: {table}  dropped={pre_dropped}")
 
         # Delegate to the production-tested append writer in mod16.
         # storage_options is None on local-dev paths and a Fabric-token
