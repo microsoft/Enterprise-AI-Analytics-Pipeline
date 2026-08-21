@@ -72,6 +72,12 @@ _logger = logging.getLogger("pax_fabric")
 # flushing immediately afterwards eliminates this class of output loss.
 _stdout_lock = threading.Lock()
 
+# Thread lock for log-FILE writes.  Every log-file write (both write_log()'s
+# _write_to_log_file() and _FlushingFileHandler.emit(), below) opens the file,
+# writes one entry, and closes it — serialized behind this lock so concurrent
+# partition threads never interleave partial lines within the same open/write.
+_file_write_lock = threading.Lock()
+
 
 # ===========================================================================
 # INTERNAL HELPERS
@@ -83,11 +89,22 @@ def _timestamp() -> str:
 
 
 def _write_to_log_file(entry: str) -> None:
-    """Append a log entry to the log file, or buffer it if file not yet set."""
+    """Append a log entry to the log file, or buffer it if file not yet set.
+
+    Opens, writes, flushes, fsyncs, and closes the file on every call. On the
+    Fabric Lakehouse Files/ (OneLake) mount, a write is not reliably visible
+    to other readers (the Files pane, a separate notebook) until the file
+    handle is actually closed — a Python-level flush() alone is not enough.
+    Closing on every entry (rather than holding one handle open for the
+    whole run) guarantees each line lands in OneLake immediately.
+    """
     try:
         if _log_file:
-            with open(_log_file, "a", encoding="utf-8") as f:
-                f.write(entry + "\n")
+            with _file_write_lock:
+                with open(_log_file, "a", encoding="utf-8") as f:
+                    f.write(entry + "\n")
+                    f.flush()
+                    os.fsync(f.fileno())
         else:
             _log_buffer.append(entry)
     except Exception:
@@ -349,6 +366,49 @@ class _FlushingStreamHandler(logging.Handler):
             self.handleError(record)
 
 
+class _FlushingFileHandler(logging.Handler):
+    """File handler that opens, writes, flushes, fsyncs, and closes the log
+    file on every single emit — the same open/write/close pattern
+    ``_write_to_log_file()`` already uses for ``write_log()`` calls.
+
+    Background: stdlib ``logging.FileHandler`` opens ONE file handle and
+    keeps it open for the lifetime of the logger, calling ``stream.flush()``
+    after every record. On local disk that is enough to make the write
+    visible immediately. On the Fabric Lakehouse ``Files/`` mount
+    (OneLake-backed), a Python-level ``flush()`` only empties the process's
+    own buffer — it does not guarantee the underlying network filesystem
+    pushes the bytes to OneLake until the file handle is actually **closed**.
+    With a handle held open for an entire multi-hour run, every
+    ``logger.info()`` / ``logger.warning()`` call from mod7/mod11/mod12 etc.
+    (which carries most of the granular CopilotInteraction and Agent 365
+    progress detail) can sit invisible in the Lakehouse Files pane until the
+    handle finally closes — producing exactly the "log lines all appear in
+    one lump only after that phase finishes" symptom.
+
+    Opening, writing one line, flushing, fsyncing, and closing on every emit
+    (serialized via ``_file_write_lock``, shared with ``_write_to_log_file()``)
+    guarantees each record is fully released back to the filesystem — and
+    therefore visible in the Lakehouse Files pane — before the emitting
+    thread continues.
+    """
+
+    def __init__(self, filename: str, encoding: str = "utf-8") -> None:
+        super().__init__()
+        self._filename = filename
+        self._encoding = encoding
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+            with _file_write_lock:
+                with open(self._filename, "a", encoding=self._encoding) as f:
+                    f.write(msg + "\n")
+                    f.flush()
+                    os.fsync(f.fileno())
+        except Exception:
+            self.handleError(record)
+
+
 def setup_host_logging(log_file_path: str) -> None:
     """
     Initialize the logging system with a file path.
@@ -375,8 +435,11 @@ def setup_host_logging(log_file_path: str) -> None:
         # Flush buffered entries
         _flush_log_buffer()
 
-    # Configure stdlib logging so other modules can use logging.getLogger()
-    handler = logging.FileHandler(log_file_path, encoding="utf-8")
+    # Configure stdlib logging so other modules can use logging.getLogger().
+    # Uses _FlushingFileHandler (open/write/fsync/close per emit) instead of
+    # stdlib logging.FileHandler so writes are immediately visible on the
+    # Fabric Lakehouse Files/ (OneLake) mount — see class docstring.
+    handler = _FlushingFileHandler(log_file_path)
     handler.setFormatter(logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s",
                                            datefmt="%Y-%m-%d %H:%M:%S"))
     _logger.addHandler(handler)
