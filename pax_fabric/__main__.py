@@ -584,18 +584,14 @@ def main() -> int:
             print(f"{d} is deprecated and will be removed in a future release.")
         return EXIT_SUCCESS
 
-    # --- Temporarily disabled switch gate (PS L1620-1636) ---
-    _DISABLED = {
-        "include_agent365_info": "--include-agent365-info",
-        "only_agent365_info": "--only-agent365-info",
-        "output_path_agent365_info": "--output-path-agent365-info",
-        "append_agent365_info": "--append-agent365-info",
-    }
-    dis_hit = [cli for attr, cli in _DISABLED.items() if getattr(ctx.config, attr, None)]
-    if dis_hit:
-        for d in dis_hit:
-            print(f"{d} is temporarily disabled and will be enabled at a later time pending further testing.")
-        return EXIT_SUCCESS
+    # NOTE: Agent 365 switches (--include-agent365-info, --only-agent365-info,
+    # --output-path-agent365-info, --append-agent365-info) are fully
+    # implemented in Phase 7 below (mirrors the notebook entry point in
+    # pipeline.py, and PS v1.11.15 ships Agent 365 as a working feature with
+    # no such gate). A prior "temporarily disabled" gate here silently
+    # no-op'd the entire CLI run whenever any of these switches were set;
+    # it has been removed so the CLI and notebook entry points behave
+    # consistently.
 
     # --- Register graceful exit early ---
     signal.signal(signal.SIGINT, lambda s, f: _sigint_handler(s, f, ctx=ctx))

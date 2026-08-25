@@ -324,6 +324,12 @@ class PAXConfig:
     _start_date_explicit: bool = field(init=False, default=False)
     _end_date_explicit: bool = field(init=False, default=False)
 
+    # --- ExcludeCopilotInteraction/IncludeCopilotInteraction conflict flag ---
+    # Set by initialize_config() (via _detect_copilot_exclude_conflict) BEFORE
+    # resolve_activity_types() overwrites activity_types, so validate_config()
+    # can still see whether a conflict existed. PS parity: L7845-7916.
+    _copilot_exclude_conflict: bool = field(init=False, default=False)
+
     def __post_init__(self):
         """Auto-detect whether dates were explicitly set at construction time."""
         self._start_date_explicit = self.start_date is not None
@@ -387,6 +393,35 @@ def normalize_service_types(service_types: Optional[list[str]]) -> Optional[list
         normalized.append(SERVICE_CANONICAL_MAP.get(key, svc))
 
     return list(dict.fromkeys(normalized)) or None
+
+
+def _detect_copilot_exclude_conflict(config: PAXConfig) -> bool:
+    """Detect the ExcludeCopilotInteraction / IncludeCopilotInteraction conflict.
+
+    PS parity (L7845-7916): the PS script flags a conflict whenever
+    -ExcludeCopilotInteraction is combined with an explicit signal requesting
+    CopilotInteraction — either -ActivityTypes containing 'CopilotInteraction'
+    (which is true by default, since -ActivityTypes defaults to
+    @('CopilotInteraction')) or the -IncludeCopilotInteraction switch. On a
+    noninteractive host (always true for Fabric/CLI runs) PS hard-errors
+    unless -Force is supplied, in which case it silently honors the exclude.
+
+    Must be called BEFORE resolve_activity_types() overwrites
+    config.activity_types, using the post comma-split, pre-resolution list —
+    matching the PS ordering (its own comma-split normalization also runs
+    before this conflict check).
+
+    Args:
+        config: PAXConfig instance with activity_types already comma-split
+            normalized (post initialize_config step 2) but not yet resolved.
+
+    Returns:
+        True if the conflict is present (regardless of Force); callers gate
+        the actual error on config.force.
+    """
+    explicit_include = bool(config.activity_types) and (COPILOT_BASE_ACTIVITY_TYPE in config.activity_types)
+    explicit_include_via_switch = bool(config.include_copilot_interaction)
+    return bool(config.exclude_copilot_interaction and (explicit_include or explicit_include_via_switch))
 
 
 def resolve_activity_types(config: PAXConfig) -> list[str]:
@@ -664,6 +699,23 @@ def validate_config(config: PAXConfig) -> list[str]:
 
     if getattr(config, "deidentify", False) and config.export_workbook:
         errors.append("Deidentify cannot be combined with ExportWorkbook; use CSV output to avoid identifiable Excel data.")
+
+    # --- ExcludeCopilotInteraction conflict (v1.11.15 parity, PS L7845-7916) ---
+    # PS prompts INCLUDE/EXCLUDE interactively, or hard-errors on a
+    # noninteractive host unless -Force is set (which silently honors the
+    # exclude). Fabric/CLI runs are always noninteractive, so this collapses
+    # to: conflict + not Force => error; conflict + Force => proceed silently
+    # (resolve_activity_types already strips CopilotInteraction on exclude).
+    if getattr(config, "_copilot_exclude_conflict", False) and not config.force:
+        errors.append(
+            "ExcludeCopilotInteraction conflicts with an explicit request to include "
+            "CopilotInteraction (via ActivityTypes or IncludeCopilotInteraction). "
+            "This cannot be resolved interactively on a Fabric/CLI run. Re-run with "
+            "EITHER IncludeCopilotInteraction (to include Copilot data, overriding "
+            "ExcludeCopilotInteraction) OR a non-default ActivityTypes list that omits "
+            "'CopilotInteraction' (to exclude it without ambiguity), OR set Force=True "
+            "to honor ExcludeCopilotInteraction without prompting."
+        )
 
     filler = getattr(config, "filler_label", None)
     filler_text = getattr(config, "filler_label_text", None)
@@ -1362,6 +1414,11 @@ def initialize_config(config: PAXConfig) -> list[str]:
         config.group_names = resolve_comma_separated_values(config.group_names)
     if config.agent_id:
         config.agent_id = resolve_comma_separated_values(config.agent_id)
+
+    # 3a. Detect ExcludeCopilotInteraction conflict (PS L7845-7916) BEFORE
+    # resolve_activity_types() overwrites activity_types below — see
+    # _detect_copilot_exclude_conflict() docstring for why ordering matters.
+    config._copilot_exclude_conflict = _detect_copilot_exclude_conflict(config)
 
     # 3. M365 usage side-effects
     apply_m365_usage_mode(config)
