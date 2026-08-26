@@ -22,7 +22,10 @@
             "Rollup":           { "value": "@pipeline().parameters.Rollup",           "type": "bool"   },
             "IncludeM365Usage": { "value": "@pipeline().parameters.IncludeM365Usage", "type": "bool"   },
             "IncludeUserInfo":  { "value": "@pipeline().parameters.IncludeUserInfo",  "type": "bool"   },
-            "OnlyUserInfo":     { "value": "@pipeline().parameters.OnlyUserInfo",     "type": "bool"   }
+            "OnlyUserInfo":     { "value": "@pipeline().parameters.OnlyUserInfo",     "type": "bool"   },
+            "IncludeAgent365Info": { "value": "@pipeline().parameters.IncludeAgent365Info", "type": "bool"   },
+            "OnlyAgent365Info":    { "value": "@pipeline().parameters.OnlyAgent365Info",    "type": "bool"   },
+            "GroupNames":          { "value": "@pipeline().parameters.GroupNames",          "type": "string" }
           }
         }
       }
@@ -34,7 +37,10 @@
       "Rollup":           { "type": "bool",   "defaultValue": true  },
       "IncludeM365Usage": { "type": "bool",   "defaultValue": true  },
       "IncludeUserInfo":  { "type": "bool",   "defaultValue": true  },
-      "OnlyUserInfo":     { "type": "bool",   "defaultValue": false }
+      "OnlyUserInfo":     { "type": "bool",   "defaultValue": false },
+      "IncludeAgent365Info": { "type": "bool",   "defaultValue": false },
+      "OnlyAgent365Info":    { "type": "bool",   "defaultValue": false },
+      "GroupNames":          { "type": "string", "defaultValue": ""    }
     },
     "annotations": []
   }

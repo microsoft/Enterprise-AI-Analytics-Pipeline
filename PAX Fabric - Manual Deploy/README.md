@@ -12,8 +12,9 @@ The deployment provisions four Fabric items:
 | Notebook          | Runs the `pax_fabric` Python package (cloned from GitHub at run)   |
 | Data Pipeline     | Wraps the Notebook so you can schedule daily runs                  |
 
-The pipeline pulls **Microsoft Graph Security Audit Log** and **M365 Usage Reports**
-data, normalises them, and writes them to Delta tables in the Lakehouse.
+The pipeline pulls **Microsoft Graph Security Audit Log**, **M365 Usage Reports**,
+and optional **Microsoft Agent 365** catalog data, normalises them, and writes
+them to Delta tables in the Lakehouse.
 
 ---
 
@@ -290,7 +291,10 @@ canvas level) for run-tunable knobs:
 - `StartDate` / `EndDate` — audit-log backfill window (leave empty to use
   the rolling default from the Variable Library).
 - `Rollup`, `IncludeM365Usage`, `IncludeUserInfo`, `OnlyUserInfo`,
-  `KeepScratch` — feature toggles.
+  `IncludeAgent365Info`, `OnlyAgent365Info`, `KeepScratch` — feature toggles.
+- `GroupNames` — comma-separated Entra group display names used to scope the
+  run (for example, `Finance Copilot Users,Legal Copilot Users`). Leave empty
+  for no group filter.
 - `TargetSchema` — Lakehouse schema to write into (default `dbo`).
 - `RetentionDays` — how long processed data is kept.
 - `MaxConcurrency` — default `10`. Reduce when pulling large audit-log
@@ -298,6 +302,19 @@ canvas level) for run-tunable knobs:
 
 Save the pipeline; the next run (manual or scheduled) picks up the new
 values.
+
+`IncludeAgent365Info` adds Agent 365 catalog output to the normal audit run.
+`OnlyAgent365Info` skips the audit pull and retrieves only Agent 365 catalog
+data. Do not enable both switches in the same run. `GroupNames` cannot be used
+with `OnlyAgent365Info` because that mode does not process user-scoped audit
+data.
+
+For deployments created before these parameters were added, rerunning the
+deployment script reuses the existing pipeline and does not replace its saved
+definition. Add `IncludeAgent365Info` and `OnlyAgent365Info` as Boolean pipeline
+parameters (default `false`) and `GroupNames` as a String parameter (default
+empty), then add matching Base parameters to the `RunPaxNotebook` activity.
+Fresh deployments include all three automatically.
 
 **Edit the Variable Library** (Fabric portal → workspace → open
 `<VarLibName>` → active value set → edit → **Save**) for values the

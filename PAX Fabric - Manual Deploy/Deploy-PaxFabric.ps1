@@ -257,7 +257,7 @@ if ($varLib) {
     # Inject customer values directly into the primary (Default) value set.
     # The primary value set = the `value` field on each entry in variables.json.
     # This makes the built-in "Default value set" (which is always Active) show the real values in the Fabric UI.
-    # Env constants only; run-shape switches (StartDate/EndDate/Rollup/Include*/OnlyUserInfo) live on the pipeline.
+    # Env constants only; run-shape switches (dates, Include*/Only*, GroupNames) live on the pipeline.
     $customerValues = [ordered]@{
         TenantId       = $cfg.AppRegistration.TenantId
         ClientId       = $cfg.AppRegistration.ClientId
