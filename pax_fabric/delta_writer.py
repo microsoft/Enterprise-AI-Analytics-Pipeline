@@ -167,7 +167,8 @@ def csv_dir_to_delta(
             drains automatically pick up rotated tokens.
 
     Returns:
-        List of dicts, one per written CSV. Empty CSVs are skipped.
+        List of dicts, one per written CSV, plus an initialization entry when
+        the mandatory empty Agent365 table is created. Empty CSVs are skipped.
         Drift-rejected or retry-exhausted CSVs are skipped with a WARN-
         level log message and excluded from the return list (matches
         v1.11.1 fail-soft per-table behavior).
@@ -205,8 +206,10 @@ def csv_dir_to_delta(
 
     csv_files = sorted(glob(os.path.join(csv_dir, "*.csv")))
     if not csv_files:
-        _log(f"No CSV files in {csv_dir} — nothing to write.", level="WARN")
-        return []
+        _log(
+            f"No CSV files in {csv_dir} — ensuring mandatory tables only.",
+            level="WARN",
+        )
 
     results: list[dict] = []
     for csv_path in csv_files:
@@ -295,6 +298,43 @@ def csv_dir_to_delta(
                 "rows_written": rows,
                 "is_init": is_init,
                 "added_cols": added_cols,
+            }
+        )
+
+    # Agent365 is optional to collect but mandatory for the Power BI model.
+    # Ensure its table contract on every Delta drain, even when the feature
+    # was never requested, the tenant is not enrolled, or the pull returned
+    # no rows. Running this after the CSV loop means a successful populated
+    # write is preserved; an existing table is never overwritten or altered.
+    from .mod12_pax_agent365 import AGENT365_COLUMNS  # noqa: WPS433
+
+    agent365_path = (
+        f"{target_root}/Agent365"
+        if "://" in target_root
+        else os.path.join(target_root, "Agent365")
+    )
+    ensure_result = mod16_pax_delta.ensure_empty_delta_table(
+        target_uri=agent365_path,
+        columns=AGENT365_COLUMNS,
+        storage_options=storage_options,
+        max_attempts=max_attempts,
+        log_fn=log_fn,
+        token_refresh_fn=token_refresh_fn,
+    )
+    if ensure_result.get("created"):
+        _log(
+            "Delta table initialized [empty]: Agent365  "
+            f"rows=0  path={agent365_path}"
+        )
+        results.append(
+            {
+                "csv": None,
+                "table": "Agent365",
+                "path": agent365_path,
+                "rows_written": 0,
+                "is_init": True,
+                "added_cols": list(AGENT365_COLUMNS),
+                "ensured_empty": True,
             }
         )
 

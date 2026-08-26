@@ -46,6 +46,7 @@ log = logging.getLogger(__name__)
 __all__ = [
     "install_deltalake_if_missing",
     "convert_csv_to_delta",
+    "ensure_empty_delta_table",
     "test_delta_table_schema_compat",
     "write_delta_append",
 ]
@@ -740,6 +741,72 @@ def convert_csv_to_delta(
         "columns": len(safe_cols),
         "target_uri": target_uri,
     }
+
+
+def ensure_empty_delta_table(
+    target_uri: str,
+    columns: list[str],
+    *,
+    storage_options: dict | None = None,
+    max_attempts: int = _DEFAULT_DELTA_MAX_ATTEMPTS,
+    log_fn=None,
+    token_refresh_fn=None,
+) -> dict:
+    """Create a zero-row, all-string Delta table when it does not exist.
+
+    Existing tables are never written or altered. Existence is checked with
+    ``DeltaTable.is_deltatable`` so access and connectivity errors propagate
+    through the normal retry/error classification instead of being treated as
+    a missing table.
+    """
+    if not columns:
+        raise ValueError("columns must contain at least one column name")
+
+    import pyarrow as pa
+    from deltalake import DeltaTable
+    from deltalake import write_deltalake as _write_deltalake
+
+    safe_cols = _sanitize_col_names(columns)
+    initial_opts = _build_storage_options(
+        target_uri, bearer_token=None, storage_options=storage_options,
+    )
+
+    def _ensure(opts):
+        if DeltaTable.is_deltatable(target_uri, storage_options=opts):
+            return {
+                "created": False,
+                "rows_written": 0,
+                "columns": len(safe_cols),
+                "target_uri": target_uri,
+            }
+
+        empty_table = pa.Table.from_arrays(
+            [pa.array([], type=pa.string()) for _ in safe_cols],
+            names=safe_cols,
+        )
+        _write_deltalake(
+            target_uri,
+            empty_table,
+            mode="append",
+            schema_mode="merge",
+            storage_options=opts,
+        )
+        return {
+            "created": True,
+            "rows_written": 0,
+            "columns": len(safe_cols),
+            "target_uri": target_uri,
+        }
+
+    return _retry_delta_write(
+        _ensure,
+        initial_storage_options=initial_opts,
+        table_name=os.path.basename(target_uri.rstrip("/")),
+        log_fn=log_fn,
+        max_attempts=max(1, int(max_attempts)),
+        base_delay=_DEFAULT_DELTA_BASE_DELAY_SEC,
+        token_refresh_fn=token_refresh_fn,
+    )
 
 
 # Default Arrow scan batch size for streaming column drops. ~100k rows of
