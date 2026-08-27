@@ -1706,14 +1706,31 @@ def load_entra_and_write_users(
 # ---------------------------------------------------------------------------
 
 
-def mint_user_key(user_key_map: dict[str, int], normalized_key: str) -> int:
-    """Return the existing UserKey INT for ``normalized_key``, or mint a new
-    one (1-based, in first-encounter order) and store it in ``user_key_map``."""
-    key = user_key_map.get(normalized_key)
+class SurrogateMap(dict[str, int]):
+    def __init__(self) -> None:
+        super().__init__()
+        self.next_value = 1
+
+    def __setitem__(self, key: str, value: int) -> None:
+        super().__setitem__(key, value)
+        self.next_value = max(self.next_value, value + 1)
+
+
+def mint_surrogate(key_map: dict[str, int], raw_key: str) -> int:
+    """Return an existing surrogate or allocate above every reserved value."""
+    key = key_map.get(raw_key)
     if key is None:
-        key = len(user_key_map) + 1
-        user_key_map[normalized_key] = key
+        if isinstance(key_map, SurrogateMap):
+            key = key_map.next_value
+        else:
+            key = max(key_map.values(), default=0) + 1
+        key_map[raw_key] = key
     return key
+
+
+def mint_user_key(user_key_map: dict[str, int], normalized_key: str) -> int:
+    """Return the stable UserKey INT for ``normalized_key``."""
+    return mint_surrogate(user_key_map, normalized_key)
 
 
 def explode_record(
@@ -1766,10 +1783,7 @@ def explode_record(
     # append dedup stay consistent.
     thread_id_raw = deid_guid(to_text(ced.get("ThreadId")))
     if thread_id_raw:
-        thread_key = thread_key_map.get(thread_id_raw)
-        if thread_key is None:
-            thread_key = len(thread_key_map) + 1
-            thread_key_map[thread_id_raw] = thread_key
+        thread_key = mint_surrogate(thread_key_map, thread_id_raw)
     else:
         thread_key = ""
     app_host_str = to_text(ced.get("AppHost"))
@@ -2207,9 +2221,9 @@ def run_processor(
     # Shared INT-surrogate maps. UserKey is populated first by the Entra
     # loader (so Entra-known users get the lowest INTs / lowest dictionary
     # offsets in VertiPaq); the fact path then reuses + extends the map.
-    user_key_map: dict[str, int] = {}
-    thread_key_map: dict[str, int] = {}
-    mid_to_int: dict[str, int] = {}
+    user_key_map: dict[str, int] = SurrogateMap()
+    thread_key_map: dict[str, int] = SurrogateMap()
+    mid_to_int: dict[str, int] = SurrogateMap()
     # Rollup-loop dedup policy. Cross-run dedup against the target Fact CSV is
     # performed exclusively in the PowerShell-side Merge-FactCsv (which keys on
     # Message_Id_Raw and computes Retained / New / Departed = current∩target /
@@ -2299,10 +2313,7 @@ def run_processor(
                 stats["output_rows"] += 1
                 if not in_entra and audit_user_norm:
                     unmatched.add(audit_user_norm)
-                mid_int = mid_to_int.get(message_id_str)
-                if mid_int is None:
-                    mid_int = len(mid_to_int) + 1
-                    mid_to_int[message_id_str] = mid_int
+                mid_int = mint_surrogate(mid_to_int, message_id_str)
                 rollup[(grain_key, mid_int)] = nongrain
 
     if not quiet:
