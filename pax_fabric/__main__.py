@@ -2936,6 +2936,19 @@ def _run_rollup_processors(
                                 level="WARNING",
                             )
                     write_log(f"[SQLITE] Removed driver-local state path={state_db_path}")
+                    parent = Path(state_db_path).parent
+                    if parent.name.startswith("pax_copilot_state_"):
+                        try:
+                            import shutil as _shutil
+                            _shutil.rmtree(parent, ignore_errors=True)
+                            write_log(
+                                f"[SQLITE] Removed driver-local state dir path={parent}"
+                            )
+                        except OSError as ex:
+                            write_log(
+                                f"[SQLITE] Could not remove state dir path={parent}: {ex}",
+                                level="WARNING",
+                            )
 
             raw_csv_list.append(ctx.output_file)
             # Entra CSV is an internal join input; under -Rollup it is deleted

@@ -210,13 +210,45 @@ def _iter_delta_as_dicts(
             yield row
 
 
+_ONELAKE_MOUNT_PREFIXES: tuple[str, ...] = (
+    "/lakehouse/",
+    "/mnt/lakehouse/",
+    "/synfs/",
+    "abfss://",
+    "https://onelake.dfs.fabric.microsoft.com/",
+)
+
+
+def _classify_state_path(path: str) -> str:
+    """Return 'onelake', 'driver-tmp', or 'other' for the SQLite host mount."""
+    import tempfile as _tempfile
+
+    normalized = str(path).replace("\\", "/")
+    for prefix in _ONELAKE_MOUNT_PREFIXES:
+        if normalized.startswith(prefix):
+            return "onelake"
+    tmp_root = str(_tempfile.gettempdir()).replace("\\", "/")
+    if normalized.startswith(tmp_root):
+        return "driver-tmp"
+    return "other"
+
+
 def _prepare_copilot_delta_seeds(
     ctx: PAXRunContext,
     schema: str,
     name_overrides: dict[str, str],
-    seed_dir: str,
 ) -> dict[str, str | None]:
-    """Stream validated Delta continuity mappings into local SQLite state."""
+    """Stream validated Delta continuity mappings into local SQLite state.
+
+    The SQLite database is placed on the driver's local temp filesystem
+    (``tempfile.gettempdir()``) — NOT on the OneLake mount — so every read
+    and write hits real local disk instead of round-tripping through
+    remote storage. The caller is responsible for removing the returned
+    ``state_db_path`` (and its parent temp dir) when the run completes.
+    """
+    import shutil
+    import tempfile
+
     from .delta_writer import table_name_for
     from .sqlite_store import SQLiteStateStore
 
@@ -235,9 +267,24 @@ def _prepare_copilot_delta_seeds(
         if str(getattr(ctx.config, "dashboard", "AIO") or "AIO").upper() == "VALUELENS"
         else "User_Id_Normalized"
     )
-    state_dir = Path(seed_dir) / "_copilot_sqlite"
-    state_dir.mkdir(parents=True, exist_ok=True)
+    tmp_root = tempfile.gettempdir()
+    state_dir = Path(tempfile.mkdtemp(prefix="pax_copilot_state_"))
     state_path = state_dir / "copilot_state.sqlite"
+    locality = _classify_state_path(str(state_path))
+    try:
+        free_mib = shutil.disk_usage(str(state_dir)).free / (1024 * 1024)
+    except OSError:
+        free_mib = -1.0
+    write_log(
+        f"[SQLITE] Selected driver-local state mount locality={locality} "
+        f"tmpRoot={tmp_root} path={state_path} freeMiB={free_mib:,.0f}"
+    )
+    if locality != "driver-tmp":
+        write_log(
+            f"[SQLITE] WARNING state path locality={locality} is not driver-local tmp; "
+            f"expected prefix={tmp_root}",
+            level="WARNING",
+        )
     for suffix in ("", "-journal", "-wal", "-shm"):
         candidate = Path(str(state_path) + suffix)
         if candidate.exists():
@@ -1071,7 +1118,6 @@ def run(params: Optional[dict] = None) -> dict:
                     ctx,
                     target_schema,
                     name_overrides,
-                    csv_root,
                 )
             _run_rollup_processors(ctx, **rollup_seed_paths)
 
