@@ -2848,6 +2848,7 @@ def _run_rollup_processors(
     seed_mid_map_path: str | None = None,
     seed_thread_map_path: str | None = None,
     seed_userkey_map_path: str | None = None,
+    state_db_path: str | None = None,
 ) -> None:
     """Invoke rollup post-processors (replaces Invoke-EmbeddedProcessor).
 
@@ -2907,17 +2908,34 @@ def _run_rollup_processors(
             _copilot_mod2._HIER_FILL_MODE = _hier_fill_mode
             _copilot_mod2._HIER_FILL_LABEL = _hier_fill_label
 
-            copilot_run(
-                purview_csv=ctx.output_file,
-                entra_csv=entra_csv,
-                fact_out_csv=str(out_dir / f"{purview_stem}_Interactions.csv"),
-                users_out_csv=str(out_dir / f"{entra_stem}_Users.csv"),
-                profile=copilot_profile,
-                quiet=True,
-                seed_mid_map_path=seed_mid_map_path,
-                seed_thread_map_path=seed_thread_map_path,
-                seed_userkey_map_path=seed_userkey_map_path,
-            )
+            try:
+                copilot_run(
+                    purview_csv=ctx.output_file,
+                    entra_csv=entra_csv,
+                    fact_out_csv=str(out_dir / f"{purview_stem}_Interactions.csv"),
+                    users_out_csv=str(out_dir / f"{entra_stem}_Users.csv"),
+                    profile=copilot_profile,
+                    quiet=True,
+                    seed_mid_map_path=seed_mid_map_path,
+                    seed_thread_map_path=seed_thread_map_path,
+                    seed_userkey_map_path=seed_userkey_map_path,
+                    state_db_path=state_db_path,
+                    state_log_fn=write_log,
+                )
+            finally:
+                if state_db_path:
+                    for suffix in ("", "-journal", "-wal", "-shm"):
+                        candidate = Path(state_db_path + suffix)
+                        try:
+                            if candidate.exists():
+                                candidate.unlink()
+                        except OSError as ex:
+                            write_log(
+                                f"[SQLITE] Could not remove temporary file "
+                                f"path={candidate}: {ex}",
+                                level="WARNING",
+                            )
+                    write_log(f"[SQLITE] Removed driver-local state path={state_db_path}")
 
             raw_csv_list.append(ctx.output_file)
             # Entra CSV is an internal join input; under -Rollup it is deleted

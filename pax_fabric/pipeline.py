@@ -210,97 +210,15 @@ def _iter_delta_as_dicts(
             yield row
 
 
-def _delta_surrogate_seed(
-    table_uri: str,
-    storage_options: dict | None,
-    raw_column: str,
-    surrogate_column: str,
-) -> dict[str, int] | None:
-    """Load and validate one persisted raw-id to integer surrogate mapping."""
-    try:
-        rows = _iter_delta_as_dicts(
-            table_uri,
-            storage_options,
-            columns=[raw_column, surrogate_column],
-        )
-        mapping: dict[str, int] = {}
-        raw_by_surrogate: dict[int, str] = {}
-        for row in rows:
-            raw_value = row.get(raw_column, "").strip()
-            surrogate_text = row.get(surrogate_column, "").strip()
-            if not raw_value or not surrogate_text:
-                continue
-            try:
-                surrogate = int(surrogate_text)
-            except ValueError as ex:
-                raise RuntimeError(
-                    f"Invalid {surrogate_column} value {surrogate_text!r} "
-                    f"for {raw_column}={raw_value!r} in {table_uri}"
-                ) from ex
-            if surrogate < 1:
-                raise RuntimeError(
-                    f"Invalid non-positive {surrogate_column}={surrogate} "
-                    f"for {raw_column}={raw_value!r} in {table_uri}"
-                )
-            prior_surrogate = mapping.get(raw_value)
-            prior_raw = raw_by_surrogate.get(surrogate)
-            if prior_surrogate not in (None, surrogate) or prior_raw not in (None, raw_value):
-                raise RuntimeError(
-                    f"Conflicting persisted {raw_column}/{surrogate_column} "
-                    f"mapping in {table_uri}; rebuild the Copilot Delta tables "
-                    "before running an incremental load"
-                )
-            mapping[raw_value] = surrogate
-            raw_by_surrogate[surrogate] = raw_value
-        return mapping
-    except Exception as ex:
-        message = str(ex).lower()
-        if any(
-            marker in message
-            for marker in (
-                "not a delta table",
-                "no such file",
-                "does not exist",
-                "no files in log segment",
-            )
-        ):
-            return None
-        raise
-
-
-def _merge_surrogate_seeds(
-    first: dict[str, int] | None,
-    second: dict[str, int] | None,
-    label: str,
-) -> dict[str, int] | None:
-    """Merge two one-to-one mappings without accepting legacy collisions."""
-    if first is None and second is None:
-        return None
-    merged = dict(first or {})
-    raw_by_surrogate = {value: raw for raw, value in merged.items()}
-    for raw, surrogate in (second or {}).items():
-        prior_surrogate = merged.get(raw)
-        prior_raw = raw_by_surrogate.get(surrogate)
-        if prior_surrogate not in (None, surrogate) or prior_raw not in (None, raw):
-            raise RuntimeError(
-                f"Conflicting persisted {label} mapping across Copilot Delta "
-                "tables; rebuild the tables before running an incremental load"
-            )
-        merged[raw] = surrogate
-        raw_by_surrogate[surrogate] = raw
-    return merged
-
-
 def _prepare_copilot_delta_seeds(
     ctx: PAXRunContext,
     schema: str,
     name_overrides: dict[str, str],
     seed_dir: str,
 ) -> dict[str, str | None]:
-    """Persist validated Delta surrogate maps as processor seed JSON files."""
-    import json
-
+    """Stream validated Delta continuity mappings into local SQLite state."""
     from .delta_writer import table_name_for
+    from .sqlite_store import SQLiteStateStore
 
     root = files_io.tables_root_abfss(schema) or files_io.tables_root(schema)
     storage_options = files_io.onelake_storage_options() if "://" in root else None
@@ -317,61 +235,62 @@ def _prepare_copilot_delta_seeds(
         if str(getattr(ctx.config, "dashboard", "AIO") or "AIO").upper() == "VALUELENS"
         else "User_Id_Normalized"
     )
-    user_seed = _merge_surrogate_seeds(
-        _delta_surrogate_seed(
-            users_uri,
-            storage_options,
-            "PersonId_Normalized",
-            "UserKey",
-        ),
-        _delta_surrogate_seed(
-            fact_uri,
-            storage_options,
-            user_raw_column,
-            "UserKey",
-        ),
-        "UserKey",
-    )
-    seed_specs = {
-        "seed_thread_map_path": (
-            fact_uri,
-            "ThreadId_Raw",
-            "ThreadId",
-            "thread_seed.json",
-        ),
-        "seed_mid_map_path": (
-            fact_uri,
-            "Message_Id_Raw",
-            "Message_Id",
-            "message_seed.json",
-        ),
+    state_dir = Path(seed_dir) / "_copilot_sqlite"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    state_path = state_dir / "copilot_state.sqlite"
+    for suffix in ("", "-journal", "-wal", "-shm"):
+        candidate = Path(str(state_path) + suffix)
+        if candidate.exists():
+            candidate.unlink()
+
+    def _pairs(uri: str, raw_column: str, surrogate_column: str):
+        for row in _iter_delta_as_dicts(
+            uri, storage_options, columns=[raw_column, surrogate_column]
+        ):
+            raw_value = row.get(raw_column, "").strip()
+            surrogate_text = row.get(surrogate_column, "").strip()
+            if not raw_value or not surrogate_text:
+                continue
+            try:
+                surrogate = int(surrogate_text)
+            except ValueError as ex:
+                raise RuntimeError(
+                    f"Invalid {surrogate_column} value {surrogate_text!r} "
+                    f"for {raw_column}={raw_value!r} in {uri}"
+                ) from ex
+            yield raw_value, surrogate
+
+    def _seed(store, namespace: str, uri: str, raw_column: str, surrogate_column: str):
+        try:
+            return store.seed_rows(namespace, _pairs(uri, raw_column, surrogate_column))
+        except Exception as ex:
+            message = str(ex).lower()
+            if any(
+                marker in message
+                for marker in (
+                    "not a delta table",
+                    "no such file",
+                    "does not exist",
+                    "no files in log segment",
+                )
+            ):
+                write_log(f"[SQLITE] No prior {surrogate_column} Delta seed at {uri}")
+                return 0
+            raise
+
+    with SQLiteStateStore(str(state_path), log_fn=write_log) as store:
+        _seed(store, "user", users_uri, "PersonId_Normalized", "UserKey")
+        _seed(store, "user", fact_uri, user_raw_column, "UserKey")
+        _seed(store, "thread", fact_uri, "ThreadId_Raw", "ThreadId")
+        _seed(store, "message", fact_uri, "Message_Id_Raw", "Message_Id")
+
+    write_log(f"[SQLITE] Delta continuity seed ready path={state_path}")
+    return {
+        "seed_mid_map_path": None,
+        "seed_thread_map_path": None,
+        "seed_userkey_map_path": None,
+        "state_db_path": str(state_path),
     }
-    paths: dict[str, str | None] = {}
-    output_dir = Path(seed_dir) / "_surrogate_seeds"
-    seed_values = {
-        "seed_userkey_map_path": (user_seed, "UserKey", "userkey_seed.json"),
-    }
-    for argument, (uri, raw_column, surrogate_column, filename) in seed_specs.items():
-        mapping = _delta_surrogate_seed(
-            uri,
-            storage_options,
-            raw_column,
-            surrogate_column,
-        )
-        seed_values[argument] = (mapping, surrogate_column, filename)
-    for argument, (mapping, surrogate_column, filename) in seed_values.items():
-        if mapping is None:
-            paths[argument] = None
-            continue
-        output_dir.mkdir(parents=True, exist_ok=True)
-        path = output_dir / filename
-        path.write_text(json.dumps(mapping, separators=(",", ":")), encoding="utf-8")
-        paths[argument] = str(path)
-        write_log(
-            f"Loaded {len(mapping):,} persisted {surrogate_column} mapping(s) "
-            "from Copilot Delta history"
-        )
-    return paths
 
 
 def _recompute_userstats_from_delta(

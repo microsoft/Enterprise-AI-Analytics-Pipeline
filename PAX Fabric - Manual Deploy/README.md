@@ -233,8 +233,20 @@ This is the same code path a scheduled run will take.
    - `Graph API probe -> beta` (v1.0 currently returns 404; this is expected —
      the pipeline auto-falls back).
    - `submitted N jobs, completed N, failures 0`.
+    - `[SQLITE] Opened driver-local state ... cacheKiB=2048 freeMiB=...`.
+    - `[SQLITE] Seeded namespace=... distinctKeys=... nextValue=...` for
+       persisted UserKey, ThreadId, and Message_Id continuity.
+    - `[SQLITE] State summary users=... threads=... messages=... rollupRows=...`
+       followed by `[SQLITE] Removed driver-local state ...`.
 5. Verify Delta tables in the Lakehouse Explorer, e.g.
    `CopilotInteraction_Interactions_Rollup`, `Entra_Users`.
+
+Copilot surrogate maps, fact rollup state, and ValueLens distinct aggregates
+use a temporary SQLite database on the notebook driver. The database is rebuilt
+from Delta history on every run and deleted after processing. It is deliberately
+not stored in OneLake or under `/lakehouse/default`, because SQLite requires
+local filesystem locking and random writes. Memory use therefore stays bounded,
+but the driver must have enough temporary disk for the current run.
 
 If the run fails, see Section 5 Troubleshooting.
 
@@ -264,6 +276,8 @@ UI and saving — no redeploy required.
 | Pipeline job: `Graph API probe: v1.0 -> 404`                         | Expected. The pipeline probes v1.0 first and automatically falls back to the `/beta` endpoint. Non-fatal.                                                    |
 | Notebook cell fails with `pip: could not resolve host github.com`    | Your Fabric capacity is in a private network with no internet egress. Fork the repo into an internal-reachable mirror. |
 | `Variable Library` values wrong                                      | Edit them in the Fabric UI. The deployment script only *initialises* them at create time.                              |
+| `[SQLITE]` followed by `unable to open database file`                | The notebook driver cannot create local temporary files. Restart the session and confirm Python `tempfile` points to a writable local path. Do not redirect the SQLite file to OneLake or ABFS. |
+| `[SQLITE]` followed by `database or disk is full`                    | Driver-local scratch space was exhausted. Reduce the processing window or use a larger Fabric Spark resource profile; the log's `freeMiB` value shows space available when processing started. |
 
 ---
 
