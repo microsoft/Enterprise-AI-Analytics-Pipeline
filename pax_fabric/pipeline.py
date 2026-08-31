@@ -179,7 +179,11 @@ def _build_output_filename(cfg: PAXConfig) -> str:
     return f"Purview_Audit_{timestamp}.csv"
 
 
-def _iter_delta_as_dicts(uri: str, storage_options: dict | None):
+def _iter_delta_as_dicts(
+    uri: str,
+    storage_options: dict | None,
+    columns: list[str] | None = None,
+):
     """Yield one dict[str, str] per row from a Delta table, streaming batch by batch.
 
     Peak RAM is bounded to one Arrow batch (~65K rows) plus the yielded dict.
@@ -187,7 +191,7 @@ def _iter_delta_as_dicts(uri: str, storage_options: dict | None):
     """
     from deltalake import DeltaTable
     dt = DeltaTable(uri, storage_options=storage_options)
-    for batch in dt.to_pyarrow_dataset().to_batches():
+    for batch in dt.to_pyarrow_dataset().to_batches(columns=columns):
         columns = batch.schema.names
         col_arrays = {c: batch.column(c).to_pylist() for c in columns}
         for i in range(batch.num_rows):
@@ -204,6 +208,136 @@ def _iter_delta_as_dicts(uri: str, storage_options: dict | None):
                 else:
                     row[c] = str(v)
             yield row
+
+
+_ONELAKE_MOUNT_PREFIXES: tuple[str, ...] = (
+    "/lakehouse/",
+    "/mnt/lakehouse/",
+    "/synfs/",
+    "abfss://",
+    "https://onelake.dfs.fabric.microsoft.com/",
+)
+
+
+def _classify_state_path(path: str) -> str:
+    """Return 'onelake', 'driver-tmp', or 'other' for the SQLite host mount."""
+    import tempfile as _tempfile
+
+    normalized = str(path).replace("\\", "/")
+    for prefix in _ONELAKE_MOUNT_PREFIXES:
+        if normalized.startswith(prefix):
+            return "onelake"
+    tmp_root = str(_tempfile.gettempdir()).replace("\\", "/")
+    if normalized.startswith(tmp_root):
+        return "driver-tmp"
+    return "other"
+
+
+def _prepare_copilot_delta_seeds(
+    ctx: PAXRunContext,
+    schema: str,
+    name_overrides: dict[str, str],
+) -> dict[str, str | None]:
+    """Stream validated Delta continuity mappings into local SQLite state.
+
+    The SQLite database is placed on the driver's local temp filesystem
+    (``tempfile.gettempdir()``) — NOT on the OneLake mount — so every read
+    and write hits real local disk instead of round-tripping through
+    remote storage. The caller is responsible for removing the returned
+    ``state_db_path`` (and its parent temp dir) when the run completes.
+    """
+    import shutil
+    import tempfile
+
+    from .delta_writer import table_name_for
+    from .sqlite_store import SQLiteStateStore
+
+    root = files_io.tables_root_abfss(schema) or files_io.tables_root(schema)
+    storage_options = files_io.onelake_storage_options() if "://" in root else None
+    entra_csv = getattr(ctx, "_entra_csv_path", "") or ""
+    fact_stem = f"{Path(ctx.output_file).stem}_Interactions"
+    users_stem = f"{Path(entra_csv).stem}_Users" if entra_csv else "Entra_Users"
+    fact_table = table_name_for(fact_stem, name_overrides)
+    users_table = table_name_for(users_stem, name_overrides)
+    fact_uri = f"{root}/{fact_table}"
+    users_uri = f"{root}/{users_table}"
+
+    user_raw_column = (
+        "Audit_UserId_Normalized"
+        if str(getattr(ctx.config, "dashboard", "AIO") or "AIO").upper() == "VALUELENS"
+        else "User_Id_Normalized"
+    )
+    tmp_root = tempfile.gettempdir()
+    state_dir = Path(tempfile.mkdtemp(prefix="pax_copilot_state_"))
+    state_path = state_dir / "copilot_state.sqlite"
+    locality = _classify_state_path(str(state_path))
+    try:
+        free_mib = shutil.disk_usage(str(state_dir)).free / (1024 * 1024)
+    except OSError:
+        free_mib = -1.0
+    write_log(
+        f"[SQLITE] Selected driver-local state mount locality={locality} "
+        f"tmpRoot={tmp_root} path={state_path} freeMiB={free_mib:,.0f}"
+    )
+    if locality != "driver-tmp":
+        write_log(
+            f"[SQLITE] WARNING state path locality={locality} is not driver-local tmp; "
+            f"expected prefix={tmp_root}",
+            level="WARNING",
+        )
+    for suffix in ("", "-journal", "-wal", "-shm"):
+        candidate = Path(str(state_path) + suffix)
+        if candidate.exists():
+            candidate.unlink()
+
+    def _pairs(uri: str, raw_column: str, surrogate_column: str):
+        for row in _iter_delta_as_dicts(
+            uri, storage_options, columns=[raw_column, surrogate_column]
+        ):
+            raw_value = row.get(raw_column, "").strip()
+            surrogate_text = row.get(surrogate_column, "").strip()
+            if not raw_value or not surrogate_text:
+                continue
+            try:
+                surrogate = int(surrogate_text)
+            except ValueError as ex:
+                raise RuntimeError(
+                    f"Invalid {surrogate_column} value {surrogate_text!r} "
+                    f"for {raw_column}={raw_value!r} in {uri}"
+                ) from ex
+            yield raw_value, surrogate
+
+    def _seed(store, namespace: str, uri: str, raw_column: str, surrogate_column: str):
+        try:
+            return store.seed_rows(namespace, _pairs(uri, raw_column, surrogate_column))
+        except Exception as ex:
+            message = str(ex).lower()
+            if any(
+                marker in message
+                for marker in (
+                    "not a delta table",
+                    "no such file",
+                    "does not exist",
+                    "no files in log segment",
+                )
+            ):
+                write_log(f"[SQLITE] No prior {surrogate_column} Delta seed at {uri}")
+                return 0
+            raise
+
+    with SQLiteStateStore(str(state_path), log_fn=write_log) as store:
+        _seed(store, "user", users_uri, "PersonId_Normalized", "UserKey")
+        _seed(store, "user", fact_uri, user_raw_column, "UserKey")
+        _seed(store, "thread", fact_uri, "ThreadId_Raw", "ThreadId")
+        _seed(store, "message", fact_uri, "Message_Id_Raw", "Message_Id")
+
+    write_log(f"[SQLITE] Delta continuity seed ready path={state_path}")
+    return {
+        "seed_mid_map_path": None,
+        "seed_thread_map_path": None,
+        "seed_userkey_map_path": None,
+        "state_db_path": str(state_path),
+    }
 
 
 def _recompute_userstats_from_delta(
@@ -974,7 +1108,18 @@ def run(params: Optional[dict] = None) -> dict:
             _export_entra_users(ctx)
 
         if getattr(config, "rollup", False) or getattr(config, "rollup_plus_raw", False):
-            _run_rollup_processors(ctx)
+            rollup_seed_paths: dict[str, str | None] = {}
+            copilot_only = (
+                "CopilotInteraction" in (getattr(config, "activity_types", None) or [])
+                and not getattr(config, "include_m365_usage", False)
+            )
+            if output_mode == "delta" and copilot_only:
+                rollup_seed_paths = _prepare_copilot_delta_seeds(
+                    ctx,
+                    target_schema,
+                    name_overrides,
+                )
+            _run_rollup_processors(ctx, **rollup_seed_paths)
 
         # --------------------------------------------------------------
         # 7. Phase B drain: scratch CSVs -> Delta tables (output_mode='delta').

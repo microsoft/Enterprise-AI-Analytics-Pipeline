@@ -67,11 +67,15 @@ import hashlib
 import hmac
 import os
 import re
+import sqlite3
 import sys
+import tempfile
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+
+from ..sqlite_store import PROCESS_BATCH_SIZE, SQLiteStateStore, SQLiteSurrogateMap
 
 # Ensure stdout/stderr can emit non-ASCII characters (e.g., arrows) on Windows
 # consoles defaulting to cp1252. Safe no-op on already-UTF-8 streams.
@@ -1706,14 +1710,33 @@ def load_entra_and_write_users(
 # ---------------------------------------------------------------------------
 
 
-def mint_user_key(user_key_map: dict[str, int], normalized_key: str) -> int:
-    """Return the existing UserKey INT for ``normalized_key``, or mint a new
-    one (1-based, in first-encounter order) and store it in ``user_key_map``."""
-    key = user_key_map.get(normalized_key)
+class SurrogateMap(dict[str, int]):
+    def __init__(self) -> None:
+        super().__init__()
+        self.next_value = 1
+
+    def __setitem__(self, key: str, value: int) -> None:
+        super().__setitem__(key, value)
+        self.next_value = max(self.next_value, value + 1)
+
+
+def mint_surrogate(key_map: dict[str, int], raw_key: str) -> int:
+    """Return an existing surrogate or allocate above every reserved value."""
+    if isinstance(key_map, SQLiteSurrogateMap):
+        return key_map.get_or_create(raw_key)
+    key = key_map.get(raw_key)
     if key is None:
-        key = len(user_key_map) + 1
-        user_key_map[normalized_key] = key
+        if isinstance(key_map, SurrogateMap):
+            key = key_map.next_value
+        else:
+            key = max(key_map.values(), default=0) + 1
+        key_map[raw_key] = key
     return key
+
+
+def mint_user_key(user_key_map: dict[str, int], normalized_key: str) -> int:
+    """Return the stable UserKey INT for ``normalized_key``."""
+    return mint_surrogate(user_key_map, normalized_key)
 
 
 def explode_record(
@@ -1766,10 +1789,7 @@ def explode_record(
     # append dedup stay consistent.
     thread_id_raw = deid_guid(to_text(ced.get("ThreadId")))
     if thread_id_raw:
-        thread_key = thread_key_map.get(thread_id_raw)
-        if thread_key is None:
-            thread_key = len(thread_key_map) + 1
-            thread_key_map[thread_id_raw] = thread_key
+        thread_key = mint_surrogate(thread_key_map, thread_id_raw)
     else:
         thread_key = ""
     app_host_str = to_text(ced.get("AppHost"))
@@ -2004,7 +2024,7 @@ def _fmt_float(x: float) -> str:
 
 
 def compute_and_write_aggregates(
-    rollup: dict[tuple[Any, ...], dict[str, Any]],
+    state_store: SQLiteStateStore,
     agg_paths: dict[str, str],
     quiet: bool = False,
 ) -> dict[str, int]:
@@ -2014,59 +2034,32 @@ def compute_and_write_aggregates(
       active_days, user_month_metrics, licensed_rankings,
       unlicensed_rankings, licensed_summary.
     """
-    um: dict[tuple[str, str], dict[str, Any]] = {}
-    ua: dict[str, dict[str, Any]] = {}
+    um = {}
+    for row in state_store.iter_user_month_aggregates(_VALUEFOCUS_MODES):
+        uid, month, active_days, prompt_count, behavior_count, has_agent, rows, valuefocus, license_status = row
+        um[(uid, month)] = {
+            "active_days": active_days, "prompt_count": prompt_count,
+            "behavior_count": behavior_count, "has_agent": bool(has_agent),
+            "rows": rows, "valuefocus": valuefocus, "license": license_status,
+        }
 
-    for grain_key, nongrain in rollup.items():
-        gk = grain_key[0]  # rollup key is ((grain_tuple), mid_int)
-        mid = grain_key[1]
-        interaction_date = gk[1]
-        agent_name = gk[3]
-        license_status = gk[6]
-        uid = nongrain["Audit_UserId"]
-        month = nongrain["MonthStart"]
-        week = nongrain["WeekStart"]
-        bef = nongrain["Behavior_Enriched_Full"]
-        usage_mode = nongrain["Usage_Mode"]
-
-        mk = (uid, month)
-        a = um.get(mk)
-        if a is None:
-            a = um[mk] = {
-                "idates": set(), "mids": set(), "behaviors": set(),
-                "has_agent": False, "rows": 0, "valuefocus": 0, "license": license_status,
-            }
-        a["idates"].add(interaction_date)
-        a["mids"].add(mid)
-        a["behaviors"].add(bef)
-        if agent_name.strip():
-            a["has_agent"] = True
-        a["rows"] += 1
-        if usage_mode in _VALUEFOCUS_MODES:
-            a["valuefocus"] += 1
-        if license_status < a["license"]:
-            a["license"] = license_status
-
-        u = ua.get(uid)
-        if u is None:
-            u = ua[uid] = {"rows": 0, "weeks": set(), "license": license_status}
-        u["rows"] += 1
-        u["weeks"].add(week)
-        if license_status < u["license"]:
-            u["license"] = license_status
+    ua = {
+        uid: {"rows": rows, "week_count": week_count, "license": license_status}
+        for uid, rows, week_count, license_status in state_store.iter_user_aggregates()
+    }
 
     ads_rows: list[tuple[str, str, int, int, str]] = []
     for (uid, month), a in um.items():
-        chat_active_days = len(a["idates"])
+        chat_active_days = a["active_days"]
         if chat_active_days <= 0:
             continue
-        ads_rows.append((uid, month, chat_active_days, len(a["mids"]), a["license"]))
+        ads_rows.append((uid, month, chat_active_days, a["prompt_count"], a["license"]))
     ads_rows.sort(key=lambda r: (r[0], r[1]))
 
     umm_rows: list[tuple] = []
     for (uid, month), a in um.items():
-        active_days = len(a["idates"])
-        behavior_count = len(a["behaviors"])
+        active_days = a["active_days"]
+        behavior_count = a["behavior_count"]
         value_focus_share = (a["valuefocus"] / a["rows"]) if a["rows"] else 0.0
         has_agent = a["has_agent"]
         user_month_key = f"{uid}|{month[:7]}" if (uid and month) else ""
@@ -2083,7 +2076,7 @@ def compute_and_write_aggregates(
             if u["license"] != target_license:
                 continue
             total_prompts = u["rows"]
-            total_weeks = len(u["weeks"])
+            total_weeks = u["week_count"]
             avg_ppw = (total_prompts / total_weeks) if total_weeks else 0.0
             summary.append((uid, total_prompts, total_weeks, avg_ppw))
         avgs = sorted(s[3] for s in summary)
@@ -2170,7 +2163,7 @@ def compute_and_write_aggregates(
     return counts
 
 
-def run_processor(
+def _run_processor_with_store(
     purview_csv: str,
     entra_csv: str,
     fact_out_csv: str,
@@ -2181,6 +2174,7 @@ def run_processor(
     seed_mid_map_path: str | None = None,
     seed_thread_map_path: str | None = None,
     seed_userkey_map_path: str | None = None,
+    state_store: SQLiteStateStore | None = None,
 ) -> dict[str, Any]:
     start_time = time.perf_counter()
     stats: dict[str, Any] = {
@@ -2207,9 +2201,11 @@ def run_processor(
     # Shared INT-surrogate maps. UserKey is populated first by the Entra
     # loader (so Entra-known users get the lowest INTs / lowest dictionary
     # offsets in VertiPaq); the fact path then reuses + extends the map.
-    user_key_map: dict[str, int] = {}
-    thread_key_map: dict[str, int] = {}
-    mid_to_int: dict[str, int] = {}
+    if state_store is None:
+        raise ValueError("state_store is required")
+    user_key_map = state_store.namespace("user")
+    thread_key_map = state_store.namespace("thread")
+    mid_to_int = state_store.namespace("message")
     # Rollup-loop dedup policy. Cross-run dedup against the target Fact CSV is
     # performed exclusively in the PowerShell-side Merge-FactCsv (which keys on
     # Message_Id_Raw and computes Retained / New / Departed = current∩target /
@@ -2223,16 +2219,18 @@ def run_processor(
     # lookup; new ones extend the map. Merge-FactCsv ALSO carries Message_Id
     # forward from the target on retained rows as belt-and-suspenders.
 
-    def _load_int_seed(path: str, target: dict[str, int]) -> None:
+    def _load_int_seed(path: str, target: SQLiteSurrogateMap) -> None:
         with open(path, "r", encoding="utf-8") as f:
             data = json_loads(f.read())
         if not isinstance(data, dict):
             return
+        rows = []
         for k, v in data.items():
             try:
-                target[str(k)] = int(v)
+                rows.append((str(k), int(v)))
             except (TypeError, ValueError):
                 continue
+        state_store.seed_rows(target.namespace, iter(rows))
 
     if seed_userkey_map_path:
         _load_int_seed(seed_userkey_map_path, user_key_map)
@@ -2262,11 +2260,9 @@ def run_processor(
     # Value:  dict of non-grain attrs (last-write-wins on a per-resource
     #         basis for AccessedResource_* / SensitivityLabelId — same
     #         semantic as the prior dict-overwrite behavior).
-    rollup: dict[tuple[Any, ...], dict[str, Any]] = {}
-    unmatched: set[str] = set()
-
     with open(purview_csv, "r", encoding="utf-8-sig", newline="") as fin:
         reader = csv.DictReader(fin)
+        state_store.begin_batch()
 
         for raw_row in reader:
             stats["input_records"] += 1
@@ -2288,6 +2284,8 @@ def run_processor(
 
             try:
                 rows = explode_record(audit_data, user_lookup, user_key_map, thread_key_map, profile)
+            except sqlite3.Error:
+                raise
             except Exception:
                 stats["errors"] += 1
                 continue
@@ -2298,12 +2296,18 @@ def run_processor(
                 # downstream merge can compute Retained / New / Departed correctly.
                 stats["output_rows"] += 1
                 if not in_entra and audit_user_norm:
-                    unmatched.add(audit_user_norm)
-                mid_int = mid_to_int.get(message_id_str)
-                if mid_int is None:
-                    mid_int = len(mid_to_int) + 1
-                    mid_to_int[message_id_str] = mid_int
-                rollup[(grain_key, mid_int)] = nongrain
+                    state_store.add_unmatched_user(audit_user_norm)
+                mid_int = mint_surrogate(mid_to_int, message_id_str)
+                state_store.upsert_rollup(grain_key, mid_int, nongrain)
+            if stats["input_records"] % PROCESS_BATCH_SIZE == 0:
+                state_store.commit_batch()
+                state_store.begin_batch()
+                state_store.log_progress(
+                    f"Processed inputRecords={stats['input_records']:,} "
+                    f"rawPromptRows={stats['output_rows']:,} "
+                    f"rollupRows={state_store.rollup_count:,}"
+                )
+        state_store.commit_batch()
 
     if not quiet:
         print(f"  Input records:         {stats['input_records']:,}")
@@ -2323,30 +2327,30 @@ def run_processor(
         # list-based csv.writer.writerow path is materially faster than
         # DictWriter (skips dict-to-list translation + per-row genexpr).
         nongrain_attrs = nongrain_attrs_sel  # local rebind
-        for (grain_key, mid_int), attrs in rollup.items():
+        for (grain_key, mid_int), attrs in state_store.iter_rollup():
             # fact_header = grain_keys + ("Message_Id",) + nongrain_attrs
             row_out = list(grain_key)
             row_out.append(mid_int)
             row_out.extend(attrs[k] for k in nongrain_attrs)
             writer.writerow(row_out)
 
-    stats["output_rows_rollup"] = len(rollup)
+    stats["output_rows_rollup"] = state_store.rollup_count
     stats["distinct_message_ids"] = len(mid_to_int)
     stats["distinct_thread_ids"] = len(thread_key_map)
     stats["distinct_user_keys"] = len(user_key_map)
-    stats["unmatched_users"] = len(unmatched)
+    stats["unmatched_users"] = state_store.unmatched_user_count
 
     # Pre-aggregated tables (AIBV profile only, opt-in via --with-aggregates).
     if profile != "aio" and agg_paths:
         if not quiet:
             print()
             print("Writing pre-aggregated tables...")
-        compute_and_write_aggregates(rollup, agg_paths, quiet=quiet)
+        compute_and_write_aggregates(state_store, agg_paths, quiet=quiet)
 
     elapsed = time.perf_counter() - start_time
     if not quiet:
-        reduction_pct = (1 - len(rollup) / stats["output_rows"]) * 100 if stats["output_rows"] else 0
-        print(f"  Rollup rows:           {len(rollup):,}  ({reduction_pct:.1f}% reduction)")
+        reduction_pct = (1 - state_store.rollup_count / stats["output_rows"]) * 100 if stats["output_rows"] else 0
+        print(f"  Rollup rows:           {state_store.rollup_count:,}  ({reduction_pct:.1f}% reduction)")
         print(f"  Distinct Message_Ids:  {len(mid_to_int):,}")
         print(f"  Distinct ThreadIds:    {len(thread_key_map):,}")
         print(f"  Distinct UserKeys:     {len(user_key_map):,}")
@@ -2354,6 +2358,50 @@ def run_processor(
         print(f"  Elapsed:               {elapsed:.2f}s")
 
     return stats
+
+
+def run_processor(
+    purview_csv: str,
+    entra_csv: str,
+    fact_out_csv: str,
+    users_out_csv: str,
+    profile: str = "aibv",
+    agg_paths: dict[str, str] | None = None,
+    quiet: bool = False,
+    seed_mid_map_path: str | None = None,
+    seed_thread_map_path: str | None = None,
+    seed_userkey_map_path: str | None = None,
+    state_db_path: str | None = None,
+    state_log_fn=None,
+) -> dict[str, Any]:
+    """Run with bounded driver-local SQLite state.
+
+    ``state_db_path`` is supplied by the Fabric pipeline after streaming Delta
+    continuity seeds into the database. Standalone CLI runs create an ephemeral
+    database and can still import the legacy JSON seed arguments.
+    """
+    def _log(message: str) -> None:
+        if state_log_fn is not None:
+            state_log_fn(message)
+        elif not quiet:
+            print(f"  {message}")
+
+    if state_db_path:
+        with SQLiteStateStore(state_db_path, log_fn=_log) as state_store:
+            return _run_processor_with_store(
+                purview_csv, entra_csv, fact_out_csv, users_out_csv,
+                profile, agg_paths, quiet, seed_mid_map_path,
+                seed_thread_map_path, seed_userkey_map_path, state_store,
+            )
+
+    with tempfile.TemporaryDirectory(prefix="pax_copilot_sqlite_") as temp_dir:
+        path = str(Path(temp_dir) / "copilot_state.sqlite")
+        with SQLiteStateStore(path, log_fn=_log) as state_store:
+            return _run_processor_with_store(
+                purview_csv, entra_csv, fact_out_csv, users_out_csv,
+                profile, agg_paths, quiet, seed_mid_map_path,
+                seed_thread_map_path, seed_userkey_map_path, state_store,
+            )
 
 
 # ---------------------------------------------------------------------------
