@@ -661,6 +661,16 @@ def initialize_checkpoint_for_new_run(
             # Rollup/Processor modes
             "rollupMode": rollup_mode,
             "processorMode": all_parameters.get("_RollupProcessorMode") or "None",
+            # v1.11.15 parity (PS L25576): dashboard selection + rollup-shaping
+            # switches so a resumed run stays on the same target profile.
+            "dashboard": all_parameters.get("Dashboard") or "AIO",
+            # PS L25544 parity: key name is 'fillerLabelMode' and the value is the
+            # canonical HierarchyFillMode (none|self|manager|fixed). __main__.py
+            # canonicalizes before this point.
+            "fillerLabelMode": all_parameters.get("FillerLabel") or "",
+            "fillerLabelText": all_parameters.get("FillerLabelText") or "",
+            "deidentify": bool(all_parameters.get("Deidentify")),
+            "withAggregates": bool(all_parameters.get("WithAggregates")),
             # Auth (method only - no secrets)
             "auth": all_parameters.get("Auth") or "WebLogin",
             "tenantId": all_parameters.get("TenantId") or None,

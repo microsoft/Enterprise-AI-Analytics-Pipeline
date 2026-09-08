@@ -39,6 +39,7 @@ from typing import Any
 from .models import PAXConfig, PAXRunContext
 from .mod1_pax_config import (
     SCRIPT_VERSION,
+    canonical_filler_mode,
     check_for_updates,
     initialize_config,
     resolve_activity_types,
@@ -1234,6 +1235,14 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
             "AutoCompleteness": getattr(config, 'auto_completeness', False),
             "IncludeTelemetry": getattr(config, 'include_telemetry', False),
             "AppendFile": getattr(config, 'append_file', None),
+            "Dashboard": getattr(config, 'dashboard', 'AIO'),
+            # PS L34094 parity: checkpoint stores the CANONICAL HierarchyFillMode
+            # (none|self|manager|fixed), NOT the raw user string. The checkpoint
+            # is authoritative on resume, so canonicalize once here.
+            "FillerLabel": canonical_filler_mode(getattr(config, 'filler_label', None)),
+            "FillerLabelText": getattr(config, 'filler_label_text', None) or "",
+            "Deidentify": getattr(config, 'deidentify', False),
+            "WithAggregates": getattr(config, 'with_aggregates', False),
         }
         initialize_checkpoint_for_new_run(
             output_path=config.output_path,
@@ -2893,20 +2902,49 @@ def _run_rollup_processors(
 
             # v1.11.15 parity: -FillerLabel controls what appears in org-hierarchy
             # level slots deeper than a user's own level in the rolled-up Users
-            # output (None default; 'Blank'->none, 'Self'->self, 'RepeatManager'->
-            # manager, 'Fixed'+-FillerLabelText->literal label).
-            _filler_mode_map = {
-                None: 'none', '': 'none', 'blank': 'none',
-                'self': 'self', 'repeatmanager': 'manager', 'fixed': 'fixed',
-            }
-            _filler_raw = getattr(config, 'filler_label', None)
-            _hier_fill_mode = _filler_mode_map.get(
-                str(_filler_raw).lower() if _filler_raw else None, 'none'
-            )
+            # output. canonical_filler_mode() maps every accepted raw form
+            # (null/Blank/Self/RepeatManager/Fixed) and every canonical form
+            # (none/self/manager/fixed) — the resumed checkpoint value — to the
+            # canonical HierarchyFillMode PS threads to the processor at L46552.
+            _hier_fill_mode = canonical_filler_mode(getattr(config, 'filler_label', None))
             _hier_fill_label = getattr(config, 'filler_label_text', None) or ''
             import pax_fabric.processors.copilot_processor as _copilot_mod2
             _copilot_mod2._HIER_FILL_MODE = _hier_fill_mode
             _copilot_mod2._HIER_FILL_LABEL = _hier_fill_label
+
+            # ValueLens-only pre-aggregated tables (PS --with-aggregates). Skipped
+            # for the AIO profile (compute_and_write_aggregates itself no-ops there).
+            agg_paths: dict[str, str] | None = None
+            if copilot_profile != 'aio' and getattr(config, 'with_aggregates', False):
+                agg_paths = {
+                    "active_days": str(out_dir / f"{purview_stem}_ActiveDaysSummary.csv"),
+                    "user_month_metrics": str(out_dir / f"{purview_stem}_UserMonthMetrics.csv"),
+                    "licensed_rankings": str(out_dir / f"{purview_stem}_LicensedUserRankings.csv"),
+                    "unlicensed_rankings": str(out_dir / f"{purview_stem}_UnlicensedUserRankings.csv"),
+                    "licensed_summary": str(out_dir / f"{purview_stem}_LicensedUserSummary.csv"),
+                }
+
+            # v1.11.15 parity (PS L33429-L33445): before invoking the copilot
+            # rollup post-processor, PS emits a user-facing banner naming the
+            # processor version, the profile label ("ValueLens profile" vs
+            # "--profile aio"), and the target dashboard ("ValueLens
+            # (Analytics-Hub)" vs "AI-in-One (Analytics-Hub)"). The processor's
+            # built-in profile print is suppressed here by quiet=True, so emit
+            # a structured write_log line so notebook operators have log
+            # evidence of which profile ran.
+            _rollup_profile_label = 'ValueLens' if copilot_profile == 'aibv' else 'AI-in-One'
+            _rollup_profile_flag = '--profile aibv' if copilot_profile == 'aibv' else '--profile aio'
+            _rollup_aggregates_note = ''
+            if copilot_profile == 'aibv':
+                _rollup_aggregates_note = (
+                    ' + pre-aggregated tables' if agg_paths else ' (aggregates off)'
+                )
+            write_log(
+                f"Rollup post-processor: Purview_CopilotInteraction_Processor "
+                f"({_rollup_profile_flag}; profile={_rollup_profile_label}; "
+                f"target={_rollup_profile_label} (Analytics-Hub)"
+                f"{_rollup_aggregates_note}; inputs: Purview CSV + Entra users CSV)"
+            )
 
             try:
                 copilot_run(
@@ -2915,6 +2953,7 @@ def _run_rollup_processors(
                     fact_out_csv=str(out_dir / f"{purview_stem}_Interactions.csv"),
                     users_out_csv=str(out_dir / f"{entra_stem}_Users.csv"),
                     profile=copilot_profile,
+                    agg_paths=agg_paths,
                     quiet=True,
                     seed_mid_map_path=seed_mid_map_path,
                     seed_thread_map_path=seed_thread_map_path,
