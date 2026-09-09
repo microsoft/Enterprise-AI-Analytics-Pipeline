@@ -1649,14 +1649,27 @@ def initialize_config(config: PAXConfig) -> list[str]:
     # destination" error when the user supplies only -OutputPath + -Rollup
     # (which is the normal PS usage).
     if not errors and (config.rollup or config.rollup_plus_raw):
+        try:
+            from .mod3_pax_logging import write_log_host as _info  # type: ignore[assignment]
+        except Exception:
+            _info = print  # type: ignore[assignment]
+        rollup_switch = "-RollupPlusRaw" if config.rollup_plus_raw else "-Rollup"
         is_copilot_only = (
             not config.include_m365_usage
             and COPILOT_BASE_ACTIVITY_TYPE in config.activity_types
         )
         if is_copilot_only and not config.include_user_info:
             config.include_user_info = True
+            _info(
+                f"INFO: {rollup_switch} (CopilotInteraction mode) auto-enabled "
+                "-IncludeUserInfo (Entra users CSV is required by the post-processor)."
+            )
         if not config.combine_output:
             config.combine_output = True
+            _info(
+                f"INFO: {rollup_switch} auto-enabled -CombineOutput "
+                "(rollup post-processor requires a single combined Purview CSV)."
+            )
 
     # 7c. OnlyUserInfo post-validation side-effects (PS L1970-1971)
     # Must come AFTER validation: validation checks activity_types against
