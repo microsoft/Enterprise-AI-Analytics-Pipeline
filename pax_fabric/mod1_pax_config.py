@@ -289,6 +289,8 @@ class PAXConfig:
     deidentify: bool = False 
     filler_label: Optional[str] = None
     filler_label_text: Optional[str] = None
+    # Opt-in ValueLens pre-aggregated CSVs / Delta tables (PS --with-aggregates).
+    with_aggregates: bool = False
     user_info_file: Optional[str] = None
     # Path to a supplemental CSV that is left-joined onto the live Entra
     # directory by UserPrincipalName (hybrid enrichment). A string path, NOT
@@ -323,6 +325,11 @@ class PAXConfig:
     # --- Track whether dates were explicitly provided (mirrors PS $PSBoundParameters.ContainsKey) ---
     _start_date_explicit: bool = field(init=False, default=False)
     _end_date_explicit: bool = field(init=False, default=False)
+
+    # PS $PSBoundParameters.ContainsKey('Dashboard') parity: True when the caller
+    # supplied Dashboard (including 'AIO'), so apply_dashboard_side_effects can
+    # auto-enable Rollup for an explicit AIO the same way it does for ValueLens/M365/AISID.
+    _dashboard_explicit: bool = False
 
     # --- ExcludeCopilotInteraction/IncludeCopilotInteraction conflict flag ---
     # Set by initialize_config() (via _detect_copilot_exclude_conflict) BEFORE
@@ -673,6 +680,38 @@ def test_is_non_interactive() -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# FillerLabel canonicalization (v1.11.15 parity, PS L8237-8248).
+# Maps every accepted raw / synonym / already-canonical form to the four
+# canonical HierarchyFillMode values that PS threads to the CopilotInteraction
+# processor and stores in the checkpoint (PS L25544, L34094, L46552).
+#   raw           -> canonical
+#   None / ''     -> 'none'
+#   'null'        -> 'none'   (PS canonical name for "no filler")
+#   'blank'       -> 'none'   (Python legacy synonym for PS 'null')
+#   'none'        -> 'none'   (canonical passthrough / resumed checkpoint)
+#   'self'        -> 'self'
+#   'repeatmanager' -> 'manager'
+#   'manager'     -> 'manager' (canonical passthrough / resumed checkpoint)
+#   'fixed'       -> 'fixed'
+# ---------------------------------------------------------------------------
+_FILLER_MODE_MAP = {
+    None: "none", "": "none",
+    "null": "none", "blank": "none", "none": "none",
+    "self": "self",
+    "repeatmanager": "manager", "manager": "manager",
+    "fixed": "fixed",
+}
+
+
+def canonical_filler_mode(raw) -> str:
+    """Return the PS-canonical HierarchyFillMode for any accepted FillerLabel."""
+    if raw is None:
+        return "none"
+    key = str(raw).lower().strip()
+    return _FILLER_MODE_MAP.get(key, "none")
+
+
 # ===========================================================================
 # VALIDATION FUNCTIONS
 # ===========================================================================
@@ -686,10 +725,21 @@ def validate_config(config: PAXConfig) -> list[str]:
     """
     errors: list[str] = []
 
+    # PS L1881 [ValidateSet('AIO','ValueLens','M365','AISID')] parity — reject
+    # anything outside the four accepted values before any downstream comparison
+    # (all uppercase-based) silently no-ops on an unknown dashboard.
+    _dash_raw = str(getattr(config, "dashboard", "AIO") or "AIO")
+    _dash_uc = _dash_raw.upper()
+    if _dash_uc not in {"AIO", "VALUELENS", "M365", "AISID"}:
+        errors.append(
+            f"Dashboard='{_dash_raw}' is not a valid value. "
+            "Use one of: AIO, ValueLens, M365, AISID."
+        )
+
     # v1.11.15 intentionally ships AISID as a gated preview. Keep Fabric in
     # lockstep with the source script: fail early rather than claim success
     # while omitting Defender/AISID datasets.
-    if str(getattr(config, "dashboard", "AIO")).upper() == "AISID":
+    if _dash_uc == "AISID":
         errors.append(
             "Dashboard=AISID is temporarily gated in PAX v1.11.15 and is not "
             "available for customer use."
@@ -717,14 +767,52 @@ def validate_config(config: PAXConfig) -> list[str]:
             "to honor ExcludeCopilotInteraction without prompting."
         )
 
+    # --- FillerLabel / FillerLabelText (v1.11.15 parity, PS L8210-8259) ------
+    # PS accepts four raw values (case-insensitive): null | Self | RepeatManager
+    # | Fixed, resolved to canonical HierarchyFillMode (none | self | manager |
+    # fixed). We accept the PS raw names, the Python legacy synonym 'Blank'
+    # (== PS 'null'), AND the canonical forms so a resumed checkpoint (which
+    # stores the canonical mode, per PS L25544/L34094) passes re-validation.
     filler = getattr(config, "filler_label", None)
     filler_text = getattr(config, "filler_label_text", None)
+    _filler_accepted = {
+        "null", "blank", "none",          # -> mode 'none'
+        "self",                            # -> mode 'self'
+        "repeatmanager", "manager",       # -> mode 'manager'
+        "fixed",                           # -> mode 'fixed' (requires text)
+    }
     if filler:
-        if str(filler).lower() not in {"blank", "fixed"}:
-            errors.append("FillerLabel must be either 'Blank' or 'Fixed'.")
-        if str(filler).lower() == "fixed" and not str(filler_text or "").strip():
+        fl_lc = str(filler).lower().strip()
+        if fl_lc not in _filler_accepted:
+            errors.append(
+                "FillerLabel must be one of: null, Blank, Self, RepeatManager, "
+                "or Fixed (with FillerLabelText '<text>')."
+            )
+        # PS L8227-8231: -FillerLabel requires -Rollup or -RollupPlusRaw.
+        if not (getattr(config, "rollup", False) or getattr(config, "rollup_plus_raw", False)):
+            errors.append(
+                "FillerLabel requires Rollup or RollupPlusRaw — it only affects "
+                "the rolled-up AI-in-One / ValueLens Users output."
+            )
+        # PS L8232-8235: -FillerLabel is not valid with the M365 dashboard.
+        _dash_uc = str(getattr(config, "dashboard", "AIO") or "AIO").upper()
+        if getattr(config, "include_m365_usage", False) or _dash_uc == "M365":
+            errors.append(
+                "FillerLabel is not valid with the M365 dashboard "
+                "(IncludeM365Usage or Dashboard='M365'). The org / manager "
+                "hierarchy is produced only for the AI-in-One and ValueLens dashboards."
+            )
+        # PS L8249-8253: Fixed requires non-empty FillerLabelText.
+        if fl_lc == "fixed" and not str(filler_text or "").strip():
             errors.append("FillerLabelText is required when FillerLabel is 'Fixed'.")
+        # PS L8256-8258: FillerLabelText is only valid with Fixed.
+        if fl_lc != "fixed" and str(filler_text or "").strip():
+            errors.append(
+                f"FillerLabelText is only valid with FillerLabel='Fixed' "
+                f"(not with '{filler}')."
+            )
     elif filler_text:
+        # PS L8222-8225: bare -FillerLabelText without -FillerLabel is an error.
         errors.append("FillerLabelText can only be used with FillerLabel='Fixed'.")
 
     # --- UserInfoFile / UserInfoSupplement (v1.11.15 parity) -----------------
@@ -777,6 +865,67 @@ def validate_config(config: PAXConfig) -> list[str]:
     # Rollup mutual exclusion
     if config.rollup and config.rollup_plus_raw:
         errors.append("Rollup and RollupPlusRaw are mutually exclusive.")
+
+    # Dashboard vs IncludeM365Usage compatibility (PS L8086-8098).
+    # PS gates the incompat inside `if ($dashboardExplicit)` so a bare
+    # -IncludeM365Usage (no explicit -Dashboard) is a legal M365-only run.
+    # Mirror that here via _dashboard_explicit — otherwise Fabric users who
+    # leave Dashboard blank + toggle IncludeM365Usage hit a spurious error.
+    if getattr(config, "_dashboard_explicit", False):
+        dashboard_uc = str(getattr(config, "dashboard", "AIO") or "AIO").upper()
+        if dashboard_uc in ("AIO", "VALUELENS") and config.include_m365_usage:
+            errors.append(
+                f"Dashboard={config.dashboard} and IncludeM365Usage are incompatible "
+                "(different data source AND different rollup processor). Use "
+                "Dashboard='M365' for the M365 usage bundle, or drop IncludeM365Usage "
+                "for the AIO/ValueLens CopilotInteraction rollup."
+            )
+
+    # Rollup requires a CopilotInteraction-only or M365-usage run (PS L8146-8195).
+    # Anything else has no rollup processor defined.
+    if (config.rollup or config.rollup_plus_raw) and not config.include_m365_usage:
+        rollup_switch = "Rollup" if config.rollup else "RollupPlusRaw"
+        activity_snapshot = [
+            str(a).strip() for a in (config.activity_types or []) if str(a).strip()
+        ]
+        is_copilot_only = (
+            not activity_snapshot
+            or (len(activity_snapshot) == 1 and activity_snapshot[0].lower() == "copilotinteraction")
+        )
+        if not is_copilot_only:
+            errors.append(
+                f"{rollup_switch} is only valid for CopilotInteraction-only runs or "
+                f"IncludeM365Usage runs. Detected ActivityTypes: {', '.join(activity_snapshot)}. "
+                f"Remove {rollup_switch}, restrict ActivityTypes to 'CopilotInteraction', "
+                f"or set IncludeM365Usage=True."
+            )
+
+    # Rollup + incompatible-mode blockers (PS L8134-8140). The rollup post-processor
+    # only runs on the standard live Copilot/M365 path, so any switch that skips or
+    # replaces that path must hard-fail rather than silently produce no rollup CSVs.
+    if config.rollup or config.rollup_plus_raw:
+        rollup_switch = "Rollup" if config.rollup else "RollupPlusRaw"
+        rollup_blockers: list[str] = []
+        if config.use_eom:
+            rollup_blockers.append("UseEOM")
+        if config.export_workbook:
+            rollup_blockers.append("ExportWorkbook")
+        if config.only_user_info:
+            rollup_blockers.append("OnlyUserInfo")
+        if config.only_agent365_info:
+            rollup_blockers.append("OnlyAgent365Info")
+        if config.raw_input_csv:
+            rollup_blockers.append("RAWInputCSV")
+        # ExcludeCopilotInteraction only blocks rollup when M365Usage is NOT the target
+        # (M365Bundle mode does not need CopilotInteraction rows).
+        if config.exclude_copilot_interaction and not config.include_m365_usage:
+            rollup_blockers.append("ExcludeCopilotInteraction")
+        if rollup_blockers:
+            errors.append(
+                f"{rollup_switch} is not supported with: {', '.join(rollup_blockers)}. "
+                f"The rollup post-processor requires a live CopilotInteraction-only or "
+                f"IncludeM365Usage run; remove the conflicting switch(es) and re-run."
+            )
 
     # IncludeAgent365Info / OnlyAgent365Info mutual exclusion
     if config.include_agent365_info and config.only_agent365_info:
@@ -1239,6 +1388,55 @@ def compute_trim_boundaries(config: PAXConfig) -> None:
 
 
 # ===========================================================================
+# DASHBOARD SIDE-EFFECTS  (PS L8082-8114 parity)
+# ===========================================================================
+
+def apply_dashboard_side_effects(config: PAXConfig) -> None:
+    """Apply auto-enables implied by ``Dashboard`` before other side-effects run.
+
+    Mirrors PS L8082-8114:
+      * ``Dashboard=M365`` without ``IncludeM365Usage`` auto-enables it.
+      * A NON-DEFAULT ``Dashboard`` (``ValueLens``/``M365``/``AISID``) without
+        ``Rollup``/``RollupPlusRaw`` auto-enables ``Rollup``.
+
+    The default ``AIO`` value is treated as inert (indistinguishable from
+    "caller did not supply Dashboard"), so today's callers who set only
+    ``Rollup=False`` keep today's behaviour.
+
+    The Dashboard + IncludeM365Usage incompatibility (AIO|ValueLens + M365) is
+    NOT decided here — it becomes a hard-fail in :func:`validate_config` so
+    users get a single, consistent error surface.
+    """
+    # PS L8101, L8113 emit INFO lines when Dashboard implies a switch flip so
+    # operators can see WHY Rollup/IncludeM365Usage turned on. Lazy-import so
+    # this module stays import-safe when logging isn't wired yet.
+    try:
+        from .mod3_pax_logging import write_log_host as _info  # type: ignore[assignment]
+    except Exception:
+        _info = print  # type: ignore[assignment]
+
+    dashboard_raw = str(getattr(config, "dashboard", "AIO") or "AIO")
+    dashboard = dashboard_raw.upper()
+    if dashboard == "M365" and not config.include_m365_usage:
+        config.include_m365_usage = True
+        _info(
+            "INFO: -Dashboard M365 auto-enabled -IncludeM365Usage "
+            "(the M365 dashboard consumes the M365 usage bundle)."
+        )
+    # PS L8087-8115: only an EXPLICITLY supplied -Dashboard implies Rollup. The
+    # dataclass default (Dashboard='AIO' but caller never touched it) stays inert,
+    # preserving today's raw-only behaviour for bare pipeline.run() calls.
+    if getattr(config, "_dashboard_explicit", False) and not (
+        config.rollup or config.rollup_plus_raw
+    ):
+        config.rollup = True
+        _info(
+            f"INFO: -Dashboard {dashboard_raw} auto-enabled -Rollup "
+            "(dashboard output is produced by the rollup post-processor)."
+        )
+
+
+# ===========================================================================
 # M365 USAGE MODE SIDE-EFFECTS
 # ===========================================================================
 
@@ -1420,6 +1618,10 @@ def initialize_config(config: PAXConfig) -> list[str]:
     # _detect_copilot_exclude_conflict() docstring for why ordering matters.
     config._copilot_exclude_conflict = _detect_copilot_exclude_conflict(config)
 
+    # 3b. Dashboard-implied side-effects (PS L8082-8114). MUST run before
+    # apply_m365_usage_mode so Dashboard=M365 auto-enables the M365 bundle.
+    apply_dashboard_side_effects(config)
+
     # 3. M365 usage side-effects
     apply_m365_usage_mode(config)
 
@@ -1447,14 +1649,27 @@ def initialize_config(config: PAXConfig) -> list[str]:
     # destination" error when the user supplies only -OutputPath + -Rollup
     # (which is the normal PS usage).
     if not errors and (config.rollup or config.rollup_plus_raw):
+        try:
+            from .mod3_pax_logging import write_log_host as _info  # type: ignore[assignment]
+        except Exception:
+            _info = print  # type: ignore[assignment]
+        rollup_switch = "-RollupPlusRaw" if config.rollup_plus_raw else "-Rollup"
         is_copilot_only = (
             not config.include_m365_usage
             and COPILOT_BASE_ACTIVITY_TYPE in config.activity_types
         )
         if is_copilot_only and not config.include_user_info:
             config.include_user_info = True
+            _info(
+                f"INFO: {rollup_switch} (CopilotInteraction mode) auto-enabled "
+                "-IncludeUserInfo (Entra users CSV is required by the post-processor)."
+            )
         if not config.combine_output:
             config.combine_output = True
+            _info(
+                f"INFO: {rollup_switch} auto-enabled -CombineOutput "
+                "(rollup post-processor requires a single combined Purview CSV)."
+            )
 
     # 7c. OnlyUserInfo post-validation side-effects (PS L1970-1971)
     # Must come AFTER validation: validation checks activity_types against
@@ -1608,6 +1823,7 @@ def config_from_params(params: dict) -> "PAXConfig":
         ("enableparallel", "enable_parallel"),
         ("combineoutput", "combine_output"),
         ("respectretryafter", "respect_retry_after"),
+        ("withaggregates", "with_aggregates"),
     )
     for src, dst in bool_fields:
         v = pick(src, dst)
@@ -1662,8 +1878,16 @@ def config_from_params(params: dict) -> "PAXConfig":
         ("appenddefenderusage", "append_defender_usage"),
     ):
         v = pick(src, dst)
-        if v is not None:
-            setattr(cfg, dst, str(v))
+        if v is None:
+            continue
+        # Fabric pipeline blank parameters arrive as '' — treat as "not supplied"
+        # so we match PS's $PSBoundParameters.ContainsKey('Dashboard') semantics
+        # (blank Dashboard + IncludeM365Usage is a legal M365-usage-only run).
+        if dst == "dashboard":
+            if not str(v).strip():
+                continue
+            cfg._dashboard_explicit = True
+        setattr(cfg, dst, str(v))
 
     for src, dst, caster in (
         ("clearuncertaincreate", "clear_uncertain_create", int),

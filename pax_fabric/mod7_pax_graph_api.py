@@ -310,10 +310,15 @@ def invoke_graph_audit_query(
                     PS alias: OperationFilters.
         record_types: Optional record type filters. PS alias: RecordTypeFilters.
         service_types: Optional service/workload filters. PS alias: ServiceFilter.
-        user_principal_names: Optional UPN scope. Merged list of explicit
-            -UserIds and expanded -GroupNames members. When non-empty, sent
-            as ``userPrincipalNameFilters`` in the Graph API body so the
-            server pre-filters records before pagination.
+        user_principal_names: Optional UPN scope forwarded verbatim as
+            ``userPrincipalNameFilters`` in the Graph API body. Left in the
+            signature for backwards compatibility and small-scope callers;
+            the PAX orchestrator (mod11 → __main__._query_fn) passes ``None``
+            for PowerShell parity because the audit backend rejects large
+            filter arrays with HTTP 500 for some tenants, and the resolved
+            -UserIds / -GroupNames scope is enforced client-side after
+            normalization instead. Do not repopulate this from the pipeline
+            without validating tenant behaviour first.
         http_client: HTTP client with .post() method (e.g., httpx.Client).
         api_version: Graph API version string.
         get_uri_fn: Optional function to build the URI (defaults to get_audit_uri).

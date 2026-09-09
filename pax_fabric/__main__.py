@@ -39,6 +39,7 @@ from typing import Any
 from .models import PAXConfig, PAXRunContext
 from .mod1_pax_config import (
     SCRIPT_VERSION,
+    canonical_filler_mode,
     check_for_updates,
     initialize_config,
     resolve_activity_types,
@@ -1234,6 +1235,14 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
             "AutoCompleteness": getattr(config, 'auto_completeness', False),
             "IncludeTelemetry": getattr(config, 'include_telemetry', False),
             "AppendFile": getattr(config, 'append_file', None),
+            "Dashboard": getattr(config, 'dashboard', 'AIO'),
+            # PS L34094 parity: checkpoint stores the CANONICAL HierarchyFillMode
+            # (none|self|manager|fixed), NOT the raw user string. The checkpoint
+            # is authoritative on resume, so canonicalize once here.
+            "FillerLabel": canonical_filler_mode(getattr(config, 'filler_label', None)),
+            "FillerLabelText": getattr(config, 'filler_label_text', None) or "",
+            "Deidentify": getattr(config, 'deidentify', False),
+            "WithAggregates": getattr(config, 'with_aggregates', False),
         }
         initialize_checkpoint_for_new_run(
             output_path=config.output_path,
@@ -1660,6 +1669,10 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
         query_id = None
         while True:
             try:
+                # PS parity: never send userPrincipalNameFilters. The PowerShell
+                # script fetches tenant-wide and filters records client-side after
+                # normalization; large UPN arrays here cause tenant-side HTTP 500.
+                # target_users_set_lower already scopes results below.
                 query_id = invoke_graph_audit_query(
                     display_name=display_name,
                     start_date=block_start,
@@ -1667,7 +1680,7 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
                     operations=operations_list,
                     record_types=config.record_types,
                     service_types=config.service_types,
-                    user_principal_names=list(user_ids) if user_ids else None,
+                    user_principal_names=None,
                     http_client=http,
                     api_version=api_version,
                     partition_index=p_idx,
@@ -2121,9 +2134,11 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
                 if ((r.get('UserIds') or r.get('UserId') or '')
                     .strip().lower() in target_users_set_lower)
             ]
+            _pct = (100.0 * len(normalized) / _before_filter) if _before_filter else 0.0
             write_log(
-                f"{log_prefix} [Graph API] Applied UserIds scope filter: "
-                f"{_before_filter} \u2192 {len(normalized)} records",
+                f"{log_prefix} [Graph API] UPN filter: block \u2192 "
+                f"{_before_filter} raw, {len(normalized)} kept "
+                f"({_pct:.2f}% match)",
                 level="INFO",
             )
         return normalized
@@ -2384,6 +2399,22 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
                 streamed_count = [0]
                 page_cb = None
                 cb = None
+                # UPN filter counters: [window_pages, window_raw, window_kept,
+                #                       total_pages, total_raw, total_kept]
+                filter_stats = [0, 0, 0, 0, 0, 0]
+                _FILTER_LOG_EVERY = 100
+
+                def _emit_filter_summary(_p=p_idx, _pt=p_total, _fs=filter_stats):
+                    if not target_users_set_lower or _fs[3] <= 0:
+                        return
+                    _pct = (100.0 * _fs[5] / _fs[4]) if _fs[4] else 0.0
+                    write_log(
+                        f"  [p={_p}/{_pt}] [Graph API] UPN filter summary: "
+                        f"{_fs[3]} page(s) \u2192 {_fs[4]} raw, {_fs[5]} kept "
+                        f"({_pct:.2f}% match)",
+                        level="INFO",
+                    )
+
                 if config.memory_flush_enabled:
                     # PS L22895-L22906 parity: per-page flush, ONE file per
                     # partition, append mode, drop from memory after each
@@ -2393,8 +2424,10 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
                     )
                     _path_registered = [False]
 
-                    def _page_spill(raw_page, _p=p_idx, _ctr=streamed_count,
-                                    _path=partition_path, _registered=_path_registered):
+                    def _page_spill(raw_page, _p=p_idx, _pt=p_total,
+                                    _ctr=streamed_count,
+                                    _path=partition_path, _registered=_path_registered,
+                                    _fs=filter_stats):
                         if not raw_page:
                             return
                         normalized = convert_from_graph_audit_record(raw_page)
@@ -2409,13 +2442,24 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
                                 if ((r.get('UserIds') or r.get('UserId') or '')
                                     .strip().lower() in target_users_set_lower)
                             ]
-                            if _before_filter != len(normalized):
+                            _fs[0] += 1
+                            _fs[1] += _before_filter
+                            _fs[2] += len(normalized)
+                            _fs[3] += 1
+                            _fs[4] += _before_filter
+                            _fs[5] += len(normalized)
+                            if _fs[0] >= _FILTER_LOG_EVERY:
+                                _start = _fs[3] - _fs[0] + 1
+                                _end = _fs[3]
                                 write_log(
-                                    f"  [Graph API] Partition {_p} page-flush "
-                                    f"UserIds scope filter: {_before_filter} "
-                                    f"\u2192 {len(normalized)} records",
+                                    f"  [p={_p}/{_pt}] [Graph API] UPN filter: "
+                                    f"pages {_start}-{_end} \u2192 {_fs[1]} raw, "
+                                    f"{_fs[2]} kept (cumulative {_fs[5]}/{_fs[4]})",
                                     level="INFO",
                                 )
+                                _fs[0] = 0
+                                _fs[1] = 0
+                                _fs[2] = 0
                             if not normalized:
                                 return
                         # PS parity: append (do NOT truncate) on first page
@@ -2537,6 +2581,7 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
                             partition_end=p_end,
                             record_count=0,
                         )
+                        _emit_filter_summary()
                         return _NeedsSubdivision(
                             sub_windows=result['sub_windows'],
                             partial_count=partial_count,
@@ -2552,6 +2597,7 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
                         count = len(recs)
                         if recs:
                             _spill(recs, p_idx)
+                _emit_filter_summary()
                 # Save checkpoint after partition completes
                 save_checkpoint(
                     partition_index=p_idx,
@@ -2893,20 +2939,49 @@ def _run_rollup_processors(
 
             # v1.11.15 parity: -FillerLabel controls what appears in org-hierarchy
             # level slots deeper than a user's own level in the rolled-up Users
-            # output (None default; 'Blank'->none, 'Self'->self, 'RepeatManager'->
-            # manager, 'Fixed'+-FillerLabelText->literal label).
-            _filler_mode_map = {
-                None: 'none', '': 'none', 'blank': 'none',
-                'self': 'self', 'repeatmanager': 'manager', 'fixed': 'fixed',
-            }
-            _filler_raw = getattr(config, 'filler_label', None)
-            _hier_fill_mode = _filler_mode_map.get(
-                str(_filler_raw).lower() if _filler_raw else None, 'none'
-            )
+            # output. canonical_filler_mode() maps every accepted raw form
+            # (null/Blank/Self/RepeatManager/Fixed) and every canonical form
+            # (none/self/manager/fixed) — the resumed checkpoint value — to the
+            # canonical HierarchyFillMode PS threads to the processor at L46552.
+            _hier_fill_mode = canonical_filler_mode(getattr(config, 'filler_label', None))
             _hier_fill_label = getattr(config, 'filler_label_text', None) or ''
             import pax_fabric.processors.copilot_processor as _copilot_mod2
             _copilot_mod2._HIER_FILL_MODE = _hier_fill_mode
             _copilot_mod2._HIER_FILL_LABEL = _hier_fill_label
+
+            # ValueLens-only pre-aggregated tables (PS --with-aggregates). Skipped
+            # for the AIO profile (compute_and_write_aggregates itself no-ops there).
+            agg_paths: dict[str, str] | None = None
+            if copilot_profile != 'aio' and getattr(config, 'with_aggregates', False):
+                agg_paths = {
+                    "active_days": str(out_dir / f"{purview_stem}_ActiveDaysSummary.csv"),
+                    "user_month_metrics": str(out_dir / f"{purview_stem}_UserMonthMetrics.csv"),
+                    "licensed_rankings": str(out_dir / f"{purview_stem}_LicensedUserRankings.csv"),
+                    "unlicensed_rankings": str(out_dir / f"{purview_stem}_UnlicensedUserRankings.csv"),
+                    "licensed_summary": str(out_dir / f"{purview_stem}_LicensedUserSummary.csv"),
+                }
+
+            # v1.11.15 parity (PS L33429-L33445): before invoking the copilot
+            # rollup post-processor, PS emits a user-facing banner naming the
+            # processor version, the profile label ("ValueLens profile" vs
+            # "--profile aio"), and the target dashboard ("ValueLens
+            # (Analytics-Hub)" vs "AI-in-One (Analytics-Hub)"). The processor's
+            # built-in profile print is suppressed here by quiet=True, so emit
+            # a structured write_log line so notebook operators have log
+            # evidence of which profile ran.
+            _rollup_profile_label = 'ValueLens' if copilot_profile == 'aibv' else 'AI-in-One'
+            _rollup_profile_flag = '--profile aibv' if copilot_profile == 'aibv' else '--profile aio'
+            _rollup_aggregates_note = ''
+            if copilot_profile == 'aibv':
+                _rollup_aggregates_note = (
+                    ' + pre-aggregated tables' if agg_paths else ' (aggregates off)'
+                )
+            write_log(
+                f"Rollup post-processor: Purview_CopilotInteraction_Processor "
+                f"({_rollup_profile_flag}; profile={_rollup_profile_label}; "
+                f"target={_rollup_profile_label} (Analytics-Hub)"
+                f"{_rollup_aggregates_note}; inputs: Purview CSV + Entra users CSV)"
+            )
 
             try:
                 copilot_run(
@@ -2915,6 +2990,7 @@ def _run_rollup_processors(
                     fact_out_csv=str(out_dir / f"{purview_stem}_Interactions.csv"),
                     users_out_csv=str(out_dir / f"{entra_stem}_Users.csv"),
                     profile=copilot_profile,
+                    agg_paths=agg_paths,
                     quiet=True,
                     seed_mid_map_path=seed_mid_map_path,
                     seed_thread_map_path=seed_thread_map_path,

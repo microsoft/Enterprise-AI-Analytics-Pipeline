@@ -373,6 +373,18 @@ def _get_write_strategy(table_name: str) -> str:
         return "overwrite"
     if "SessionCohort" in table_name:
         return "overwrite"
+    # ValueLens --with-aggregates outputs are per-run derivations keyed on MonthStart, not CreationDate.
+    if any(
+        marker in table_name
+        for marker in (
+            "ActiveDaysSummary",
+            "UserMonthMetrics",
+            "LicensedUserRankings",
+            "UnlicensedUserRankings",
+            "LicensedUserSummary",
+        )
+    ):
+        return "overwrite"
 
     # Time-series tables → delete date range + append
     if table_name.endswith("_Raw"):

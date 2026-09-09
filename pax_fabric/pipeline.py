@@ -625,6 +625,34 @@ def run(params: Optional[dict] = None) -> dict:
         # 3b. Resume / Checkpoint Recovery.
         # --------------------------------------------------------------
         if config.resume is not None:
+            # PS L36162-L36228 parity: resume mode is standalone. -FillerLabel
+            # and -FillerLabelText are NOT in $allowedWithResume, so PS aborts
+            # with exit 1 BEFORE reading the checkpoint. Mirror that here for
+            # the notebook run path so the error surface matches (the checkpoint
+            # is the sole source of truth per PS L36582-L36585).
+            _resume_params_lc = {
+                str(k).lower().replace("-", "_"): v for k, v in (params or {}).items()
+            }
+            _forbidden_on_resume: list[str] = []
+            if _resume_params_lc.get("fillerlabel") or _resume_params_lc.get("filler_label"):
+                _forbidden_on_resume.append("FillerLabel")
+            if (
+                _resume_params_lc.get("fillerlabeltext")
+                or _resume_params_lc.get("filler_label_text")
+            ):
+                _forbidden_on_resume.append("FillerLabelText")
+            if _forbidden_on_resume:
+                _bad = ", ".join(_forbidden_on_resume)
+                _msg = (
+                    f"Invalid parameters used with Resume: {_bad}. "
+                    "Resume mode restores hierarchy-filler settings from the "
+                    "checkpoint (FillerLabel/FillerLabelText are checkpoint-driven "
+                    "on resume). Remove these parameters and resume again."
+                )
+                write_log(_msg, level="ERROR")
+                result["error"] = _msg
+                return result
+
             set_progress_phase("Parsing")  # Resume is part of the parsing phase
             resume_path = config.resume  # '' = auto-discover, 'path' = explicit
 
@@ -812,6 +840,24 @@ def run(params: Optional[dict] = None) -> dict:
                     config.rollup = True
                 elif rollup_mode == "RollupPlusRaw":
                     config.rollup_plus_raw = True
+
+                # Restore dashboard-shaping switches (PS L36758 parity) so a
+                # resumed ValueLens/M365 run stays on the original target profile
+                # rather than silently reverting to the AIO default.
+                if cp_params.get("dashboard"):
+                    config.dashboard = str(cp_params["dashboard"])
+                # PS L36584 parity: read canonical mode from 'fillerLabelMode';
+                # fall back to legacy 'fillerLabel' key for older Python-side
+                # checkpoints written before the v1.11.15 rename.
+                _cp_filler = cp_params.get("fillerLabelMode") or cp_params.get("fillerLabel")
+                if _cp_filler:
+                    config.filler_label = str(_cp_filler)
+                if cp_params.get("fillerLabelText"):
+                    config.filler_label_text = str(cp_params["fillerLabelText"])
+                if cp_params.get("deidentify"):
+                    config.deidentify = True
+                if cp_params.get("withAggregates"):
+                    config.with_aggregates = True
 
                 # Restore remaining settings (PS L20792+)
                 if cp_params.get("useEOM"):
