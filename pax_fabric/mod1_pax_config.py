@@ -725,10 +725,21 @@ def validate_config(config: PAXConfig) -> list[str]:
     """
     errors: list[str] = []
 
+    # PS L1881 [ValidateSet('AIO','ValueLens','M365','AISID')] parity — reject
+    # anything outside the four accepted values before any downstream comparison
+    # (all uppercase-based) silently no-ops on an unknown dashboard.
+    _dash_raw = str(getattr(config, "dashboard", "AIO") or "AIO")
+    _dash_uc = _dash_raw.upper()
+    if _dash_uc not in {"AIO", "VALUELENS", "M365", "AISID"}:
+        errors.append(
+            f"Dashboard='{_dash_raw}' is not a valid value. "
+            "Use one of: AIO, ValueLens, M365, AISID."
+        )
+
     # v1.11.15 intentionally ships AISID as a gated preview. Keep Fabric in
     # lockstep with the source script: fail early rather than claim success
     # while omitting Defender/AISID datasets.
-    if str(getattr(config, "dashboard", "AIO")).upper() == "AISID":
+    if _dash_uc == "AISID":
         errors.append(
             "Dashboard=AISID is temporarily gated in PAX v1.11.15 and is not "
             "available for customer use."
@@ -855,17 +866,20 @@ def validate_config(config: PAXConfig) -> list[str]:
     if config.rollup and config.rollup_plus_raw:
         errors.append("Rollup and RollupPlusRaw are mutually exclusive.")
 
-    # Dashboard vs IncludeM365Usage compatibility (PS L8092-8098).
-    # AIO / ValueLens rollups run the CopilotInteraction processor; M365 uses
-    # a completely different data pull and processor — refuse to guess.
-    dashboard_uc = str(getattr(config, "dashboard", "AIO") or "AIO").upper()
-    if dashboard_uc in ("AIO", "VALUELENS") and config.include_m365_usage:
-        errors.append(
-            f"Dashboard={config.dashboard} and IncludeM365Usage are incompatible "
-            "(different data source AND different rollup processor). Use "
-            "Dashboard='M365' for the M365 usage bundle, or drop IncludeM365Usage "
-            "for the AIO/ValueLens CopilotInteraction rollup."
-        )
+    # Dashboard vs IncludeM365Usage compatibility (PS L8086-8098).
+    # PS gates the incompat inside `if ($dashboardExplicit)` so a bare
+    # -IncludeM365Usage (no explicit -Dashboard) is a legal M365-only run.
+    # Mirror that here via _dashboard_explicit — otherwise Fabric users who
+    # leave Dashboard blank + toggle IncludeM365Usage hit a spurious error.
+    if getattr(config, "_dashboard_explicit", False):
+        dashboard_uc = str(getattr(config, "dashboard", "AIO") or "AIO").upper()
+        if dashboard_uc in ("AIO", "VALUELENS") and config.include_m365_usage:
+            errors.append(
+                f"Dashboard={config.dashboard} and IncludeM365Usage are incompatible "
+                "(different data source AND different rollup processor). Use "
+                "Dashboard='M365' for the M365 usage bundle, or drop IncludeM365Usage "
+                "for the AIO/ValueLens CopilotInteraction rollup."
+            )
 
     # Rollup requires a CopilotInteraction-only or M365-usage run (PS L8146-8195).
     # Anything else has no rollup processor defined.
@@ -1393,9 +1407,22 @@ def apply_dashboard_side_effects(config: PAXConfig) -> None:
     NOT decided here — it becomes a hard-fail in :func:`validate_config` so
     users get a single, consistent error surface.
     """
-    dashboard = str(getattr(config, "dashboard", "AIO") or "AIO").upper()
+    # PS L8101, L8113 emit INFO lines when Dashboard implies a switch flip so
+    # operators can see WHY Rollup/IncludeM365Usage turned on. Lazy-import so
+    # this module stays import-safe when logging isn't wired yet.
+    try:
+        from .mod3_pax_logging import write_log_host as _info  # type: ignore[assignment]
+    except Exception:
+        _info = print  # type: ignore[assignment]
+
+    dashboard_raw = str(getattr(config, "dashboard", "AIO") or "AIO")
+    dashboard = dashboard_raw.upper()
     if dashboard == "M365" and not config.include_m365_usage:
         config.include_m365_usage = True
+        _info(
+            "INFO: -Dashboard M365 auto-enabled -IncludeM365Usage "
+            "(the M365 dashboard consumes the M365 usage bundle)."
+        )
     # PS L8087-8115: only an EXPLICITLY supplied -Dashboard implies Rollup. The
     # dataclass default (Dashboard='AIO' but caller never touched it) stays inert,
     # preserving today's raw-only behaviour for bare pipeline.run() calls.
@@ -1403,6 +1430,10 @@ def apply_dashboard_side_effects(config: PAXConfig) -> None:
         config.rollup or config.rollup_plus_raw
     ):
         config.rollup = True
+        _info(
+            f"INFO: -Dashboard {dashboard_raw} auto-enabled -Rollup "
+            "(dashboard output is produced by the rollup post-processor)."
+        )
 
 
 # ===========================================================================
@@ -1834,10 +1865,16 @@ def config_from_params(params: dict) -> "PAXConfig":
         ("appenddefenderusage", "append_defender_usage"),
     ):
         v = pick(src, dst)
-        if v is not None:
-            setattr(cfg, dst, str(v))
-            if dst == "dashboard":
-                cfg._dashboard_explicit = True
+        if v is None:
+            continue
+        # Fabric pipeline blank parameters arrive as '' — treat as "not supplied"
+        # so we match PS's $PSBoundParameters.ContainsKey('Dashboard') semantics
+        # (blank Dashboard + IncludeM365Usage is a legal M365-usage-only run).
+        if dst == "dashboard":
+            if not str(v).strip():
+                continue
+            cfg._dashboard_explicit = True
+        setattr(cfg, dst, str(v))
 
     for src, dst, caster in (
         ("clearuncertaincreate", "clear_uncertain_create", int),
