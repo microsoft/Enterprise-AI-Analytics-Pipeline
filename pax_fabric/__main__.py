@@ -1669,6 +1669,10 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
         query_id = None
         while True:
             try:
+                # PS parity: never send userPrincipalNameFilters. The PowerShell
+                # script fetches tenant-wide and filters records client-side after
+                # normalization; large UPN arrays here cause tenant-side HTTP 500.
+                # target_users_set_lower already scopes results below.
                 query_id = invoke_graph_audit_query(
                     display_name=display_name,
                     start_date=block_start,
@@ -1676,7 +1680,7 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
                     operations=operations_list,
                     record_types=config.record_types,
                     service_types=config.service_types,
-                    user_principal_names=list(user_ids) if user_ids else None,
+                    user_principal_names=None,
                     http_client=http,
                     api_version=api_version,
                     partition_index=p_idx,
