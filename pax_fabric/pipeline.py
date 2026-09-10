@@ -219,6 +219,29 @@ _ONELAKE_MOUNT_PREFIXES: tuple[str, ...] = (
 )
 
 
+# Short prefixes stapled onto dashboard-shaped Delta tables so AIO/VL/M365
+# outputs don't collide. Standalone modes (OnlyUserInfo / OnlyAgent365Info)
+# get the empty prefix because their outputs are dashboard-agnostic.
+_DASHBOARD_PREFIX_MAP: dict[str, str] = {
+    "AIO": "AIO",
+    "VALUELENS": "VL",
+    "M365": "M365",
+    "AISID": "AISID",
+}
+
+
+def _resolve_dashboard_prefix(config: PAXConfig) -> str:
+    """Return the short prefix (AIO/VL/M365/AISID) or '' for shared modes."""
+    if getattr(config, "only_user_info", False):
+        return ""
+    if getattr(config, "only_agent365_info", False):
+        return ""
+    if getattr(config, "include_m365_usage", False):
+        return "M365"
+    dash = str(getattr(config, "dashboard", "AIO") or "AIO").upper()
+    return _DASHBOARD_PREFIX_MAP.get(dash, "AIO")
+
+
 def _classify_state_path(path: str) -> str:
     """Return 'onelake', 'driver-tmp', or 'other' for the SQLite host mount."""
     import tempfile as _tempfile
@@ -237,6 +260,7 @@ def _prepare_copilot_delta_seeds(
     ctx: PAXRunContext,
     schema: str,
     name_overrides: dict[str, str],
+    dashboard_prefix: str = "",
 ) -> dict[str, str | None]:
     """Stream validated Delta continuity mappings into local SQLite state.
 
@@ -257,8 +281,8 @@ def _prepare_copilot_delta_seeds(
     entra_csv = getattr(ctx, "_entra_csv_path", "") or ""
     fact_stem = f"{Path(ctx.output_file).stem}_Interactions"
     users_stem = f"{Path(entra_csv).stem}_Users" if entra_csv else "Entra_Users"
-    fact_table = table_name_for(fact_stem, name_overrides)
-    users_table = table_name_for(users_stem, name_overrides)
+    fact_table = table_name_for(fact_stem, name_overrides, dashboard_prefix)
+    users_table = table_name_for(users_stem, name_overrides, dashboard_prefix)
     fact_uri = f"{root}/{fact_table}"
     users_uri = f"{root}/{users_table}"
 
@@ -521,6 +545,9 @@ def run(params: Optional[dict] = None) -> dict:
         )
     keep_scratch = bool(params.get("KeepScratch", False))
     name_overrides = params.get("TableNameOverrides") or {}
+    # None here = auto-resolve later from the validated config so the caller
+    # can force "" to opt out of prefixing entirely.
+    prefix_override = params.get("TableNamePrefix")
 
     result: dict[str, Any] = {
         "success": False,
@@ -1159,11 +1186,16 @@ def run(params: Optional[dict] = None) -> dict:
                 "CopilotInteraction" in (getattr(config, "activity_types", None) or [])
                 and not getattr(config, "include_m365_usage", False)
             )
+            dashboard_prefix = (
+                str(prefix_override) if prefix_override is not None
+                else _resolve_dashboard_prefix(config)
+            )
             if output_mode == "delta" and copilot_only:
                 rollup_seed_paths = _prepare_copilot_delta_seeds(
                     ctx,
                     target_schema,
                     name_overrides,
+                    dashboard_prefix,
                 )
             _run_rollup_processors(ctx, **rollup_seed_paths)
 
@@ -1173,9 +1205,13 @@ def run(params: Optional[dict] = None) -> dict:
         if output_mode == "delta":
             from . import delta_writer
             set_progress_phase("Export", status="Delta drain")
+            drain_prefix = (
+                str(prefix_override) if prefix_override is not None
+                else _resolve_dashboard_prefix(config)
+            )
             write_log(
                 f"Draining {csv_root} -> Tables/{target_schema}/ "
-                f"(run_id={run_id})"
+                f"(run_id={run_id} prefix={drain_prefix or '<none>'})"
             )
 
             # Notebook flow drains via csv_dir_to_delta() here — NOT through
@@ -1192,6 +1228,7 @@ def run(params: Optional[dict] = None) -> dict:
                     write_mode="append",
                     name_overrides=name_overrides,
                     log_fn=lambda msg, lvl="INFO": write_log(msg, level=lvl),
+                    dashboard_prefix=drain_prefix,
                 )
             except Exception as ex:
                 write_log(
