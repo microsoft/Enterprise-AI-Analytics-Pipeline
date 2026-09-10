@@ -219,19 +219,19 @@ _ONELAKE_MOUNT_PREFIXES: tuple[str, ...] = (
 )
 
 
-# Short prefixes stapled onto dashboard-shaped Delta tables so AIO/VL/M365
+# Short prefixes stapled onto dashboard-shaped Delta tables so AIO/ValueLens/M365
 # outputs don't collide. Standalone modes (OnlyUserInfo / OnlyAgent365Info)
 # get the empty prefix because their outputs are dashboard-agnostic.
 _DASHBOARD_PREFIX_MAP: dict[str, str] = {
     "AIO": "AIO",
-    "VALUELENS": "VL",
+    "VALUELENS": "ValueLens",
     "M365": "M365",
     "AISID": "AISID",
 }
 
 
 def _resolve_dashboard_prefix(config: PAXConfig) -> str:
-    """Return the short prefix (AIO/VL/M365/AISID) or '' for shared modes."""
+    """Return the short prefix (AIO/ValueLens/M365/AISID) or '' for shared modes."""
     if getattr(config, "only_user_info", False):
         return ""
     if getattr(config, "only_agent365_info", False):

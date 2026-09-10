@@ -20,7 +20,7 @@ Each dict in the returned list is one written table::
 Behavior notes:
     * Same-shape CSVs from different runs land in the **same** Delta table.
       Dashboard-shaped outputs are namespaced by a short prefix
-      (``AIO_`` / ``VL_`` / ``M365_`` / ``AISID_``); dashboard-agnostic
+      (``AIO_`` / ``ValueLens_`` / ``M365_`` / ``AISID_``); dashboard-agnostic
       tables (``CopilotInteractions_Raw``, ``Entra_Users_Raw``, ``Audit_Raw``,
       ``Agent365``) stay shared. Same-run appends match v1.11.1 PowerShell
       semantics so downstream Power BI / SQL endpoint consumers see a single
@@ -269,7 +269,7 @@ def csv_dir_to_delta(
         _log(f"Delta append start: {table}{run_id_tag}  source={os.path.basename(csv_path)}")
 
         # Legacy displayName/country are only ever written by the AIO copilot
-        # profile; purge only on the AIO Users table so VL_Users isn't churned.
+        # profile; purge only on the AIO Users table so ValueLens_Users isn't churned.
         if table == "AIO_Users":
             pre_dropped = mod16_pax_delta.purge_legacy_columns(
                 target_path,
